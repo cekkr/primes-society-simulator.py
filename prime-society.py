@@ -224,6 +224,8 @@ class Person:
        self.birth_day = 0
        self.death_day = None
        self.is_alive = True
+       self.happiness = 1.0
+       self.health = 1.0
        
        # Traits
        if traits:
@@ -1640,6 +1642,7 @@ def main():
        help='Number of days to simulate (default: 1000)'
    )
    
+   global INITIAL_POPULATION
    parser.add_argument(
        '--population',
        type=int,
@@ -1665,6 +1668,7 @@ def main():
        help='Disable visualization graphs'
    )
    
+   global AUTO_SAVE
    parser.add_argument(
        '--auto-save',
        type=bool,
@@ -1702,8 +1706,7 @@ def main():
        np.random.seed(args.seed)
        logger.info(f"Random seed set to {args.seed}")
    
-   # Override global settings
-   global INITIAL_POPULATION, ENABLE_GRAPHS, AUTO_SAVE
+   # Override global settings   
    INITIAL_POPULATION = args.population
    ENABLE_GRAPHS = not args.no_graphs
    AUTO_SAVE = args.auto_save
