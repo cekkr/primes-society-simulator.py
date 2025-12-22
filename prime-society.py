@@ -689,10 +689,24 @@ class Market:
        self.prices: Dict[int, float] = {}  # Current market prices
        self.volume: Dict[int, float] = defaultdict(float)  # Daily trading volume
        self.price_history: Dict[int, deque] = defaultdict(lambda: deque(maxlen=365))
+       self.world: Optional['World'] = None
        
        # Initialize base prices
        self.prices[1] = 1.0  # Base resource
        self.prices[2] = calculate_nutrition(2) / calculate_weight(2) * 10
+
+   def set_world(self, world: 'World'):
+       """Attach the world for trade settlement"""
+       self.world = world
+
+   def _resolve_trader(self, trader_id: str):
+       if not self.world:
+           return None
+       if trader_id in self.world.people:
+           return self.world.people[trader_id]
+       if trader_id in self.world.companies:
+           return self.world.companies[trader_id]
+       return None
    
    def place_order(self, number: int, quantity: float, price: float, is_bid: bool, trader_id: str):
        """Place a buy or sell order"""
@@ -748,6 +762,16 @@ class Market:
        self.prices[number] = price
        self.volume[number] += quantity
        self.price_history[number].append(price)
+
+       seller = self._resolve_trader(seller_id)
+       if seller:
+           trade_value = price * quantity
+           if isinstance(seller, Company):
+               seller.capital += trade_value
+               if number in seller.inventory:
+                   seller.inventory[number] = max(0, seller.inventory[number] - quantity)
+           else:
+               seller.resources += trade_value
        
        logger.debug(f"Trade executed: {quantity} of {number} at {price}")
    
@@ -865,6 +889,7 @@ class World:
        
        # Systems
        self.market = Market()
+       self.market.set_world(self)
        self.political_system = PoliticalSystem()
        
        # Spatial grid: region -> district -> cells
@@ -913,8 +938,24 @@ class World:
                person.known_primes = set(primes[:random.randint(1, len(primes))])
            
            self.add_person(person)
-       
+
+       self._seed_companies()
        logger.info(f"Initialized {INITIAL_POPULATION} people")
+
+   def _seed_companies(self):
+       """Bootstrap a small number of companies to start market activity"""
+       eligible = [p for p in self.people.values()
+                   if p.age >= 16 * 365 and p.employer is None]
+       if not eligible:
+           return
+       seed_count = max(1, len(eligible) // 2000)
+       founders = sorted(eligible, key=lambda p: p.resources, reverse=True)[:seed_count]
+       for founder in founders:
+           if founder.resources <= 0:
+               continue
+           company = Company(founder, f"{founder.id[:8]}_Corp")
+           self.companies[company.id] = company
+           self.stats['companies_founded'] += 1
    
    def add_person(self, person: Person):
        """Add a person to the world"""
@@ -1038,7 +1079,7 @@ class World:
                    
                    if produced > 0:
                        # Place sell order
-                       price = self.market.get_price(best_product) * 1.1
+                       price = self.market.get_price(best_product) * (1 - MARKET_FRICTION)
                        self.market.place_order(best_product, produced, price, False, company.id)
                
                # Pay salaries
@@ -1094,14 +1135,16 @@ class World:
                
                if best_deal:
                    # Place buy order
-                   quantity = min(person.resources / self.market.get_price(best_deal), 10)
-                   self.market.place_order(best_deal, quantity, 
-                                         self.market.get_price(best_deal) * 0.9,
-                                         True, person.id)
+                   market_price = self.market.get_price(best_deal)
+                   bid_price = market_price * (1 + MARKET_FRICTION)
+                   quantity = min(person.resources / bid_price, 10)
+                   if quantity <= 0:
+                       continue
+                   self.market.place_order(best_deal, quantity, bid_price, True, person.id)
                    
                    # Simplified - immediate consumption
                    person.nutrition_level += calculate_nutrition(best_deal) * quantity * 0.1
-                   person.resources -= self.market.get_price(best_deal) * quantity
+                   person.resources -= bid_price * quantity
        
        # Natural "1" production
        ones_produced = len(self.people) * DAILY_ONE_PRODUCTION
@@ -1112,7 +1155,8 @@ class World:
                    company.inventory[1] = company.inventory.get(1, 0) + ones_produced / len(self.companies)
                    # Sell some
                    if company.inventory[1] > 10:
-                       self.market.place_order(1, company.inventory[1] * 0.5, 1.0, False, company.id)
+                       price = self.market.get_price(1) * (1 - MARKET_FRICTION)
+                       self.market.place_order(1, company.inventory[1] * 0.5, price, False, company.id)
                        company.inventory[1] *= 0.5
    
    def _phase_social(self):
