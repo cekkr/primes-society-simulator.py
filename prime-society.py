@@ -92,6 +92,19 @@ AUTO_SAVE = True
 CHECKPOINT_DIR = "checkpoints"
 
 # Logging Configuration
+CURRENT_DAY = 0
+
+def set_current_day(day: int) -> None:
+   """Update the day used in log formatting."""
+   global CURRENT_DAY
+   CURRENT_DAY = day
+
+class DayFilter(logging.Filter):
+   def filter(self, record: logging.LogRecord) -> bool:
+       if not hasattr(record, 'day'):
+           record.day = CURRENT_DAY
+       return True
+
 logging.basicConfig(
    level=logging.INFO,
    format='[Day %(day)d] %(levelname)s: %(message)s',
@@ -100,6 +113,8 @@ logging.basicConfig(
        logging.FileHandler('prime_society.log')
    ]
 )
+for handler in logging.getLogger().handlers:
+   handler.addFilter(DayFilter())
 logger = logging.getLogger(__name__)
 
 # ============= UTILITY FUNCTIONS =============
@@ -842,6 +857,7 @@ class World:
    
    def __init__(self):
        self.current_day = 0
+       set_current_day(self.current_day)
        self.people: Dict[str, Person] = {}
        self.companies: Dict[str, Company] = {}
        self.buildings: Dict[str, Building] = {}
@@ -955,6 +971,7 @@ class World:
    def simulate_day(self):
        """Simulate one day in the world"""
        self.current_day += 1
+       set_current_day(self.current_day)
        logger.info(f"Day {self.current_day} - Population: {len(self.people)}")
        
        # Phase 1: Individual activities (40% of processing)
@@ -1500,6 +1517,7 @@ class CheckpointManager:
            self.world.stats = state['stats']
            self.world.grid = state['grid']
            
+           set_current_day(self.world.current_day)
            logger.info(f"Checkpoint loaded: {filename} (Day {self.world.current_day})")
            return True
            
