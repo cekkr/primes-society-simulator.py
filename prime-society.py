@@ -51,7 +51,7 @@ TRAIT_INHERITANCE_VARIANCE = 20
 TRAIT_MUTATION_RATE = 0.1
 RELATIONSHIP_DISTANCE_THRESHOLD = 3  # cells
 RELATIONSHIP_DECAY = 0.01  # per day without interaction
-CHILD_COST = 10 * 365 * 18  # total cost to raise a child
+CHILD_COST = 365  # total cost to raise a child (to do: define value meaning)
 MIN_REPRODUCTION_AGE = 16
 MAX_REPRODUCTION_AGE = 55
 
