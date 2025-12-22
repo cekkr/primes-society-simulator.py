@@ -39,7 +39,7 @@ NUTRITION_REQUIREMENT = 1.0  # nutrition needed per person per day
 STARVATION_THRESHOLD = 0.3  # below this, person starts dying
 
 # Economic Parameters
-PRIME_DISCOVERY_COST_MULTIPLIER = 100
+PRIME_DISCOVERY_COST_MULTIPLIER = 10
 PRIME_DISCOVERY_TIME_MULTIPLIER = 1
 ENTROPY_LOSS = 0.05  # production inefficiency
 MARKET_FRICTION = 0.02
