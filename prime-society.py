@@ -1338,7 +1338,7 @@ class Visualizer:
    
    def update_plots(self):
        """Update all plots with current data"""
-       if not ENABLE_GRAPHS or not self.axes:
+       if not ENABLE_GRAPHS or self.axes is None:
            return
        
        stats = self.world.stats
