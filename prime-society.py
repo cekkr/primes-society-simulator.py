@@ -2149,10 +2149,10 @@ class World:
                if partner_id in self.people:
                    candidate = self.people[partner_id]
                    candidate_age = candidate.age / 365
-           if (candidate.is_alive and candidate.resources > child_cost * 0.5 and
+                   if (candidate.is_alive and candidate.resources > child_cost * 0.5 and
                            MIN_REPRODUCTION_AGE <= candidate_age <= MAX_REPRODUCTION_AGE):
-               partner = candidate
-               relationship_score = best_relationship[1]
+                       partner = candidate
+                       relationship_score = best_relationship[1]
        
        if partner:
            combined_resources = (person.resources + partner.resources) / (child_cost * 2)
