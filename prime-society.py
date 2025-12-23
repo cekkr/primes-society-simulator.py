@@ -27,14 +27,14 @@ import sys
 # ============= GAME CONSTANTS (EASILY TWEAKABLE) =============
 
 # World Parameters
-INITIAL_POPULATION = 10000
+INITIAL_POPULATION = 1000
 WORLD_REGIONS = 100
-DISTRICTS_PER_REGION = 4
+DISTRICTS_PER_REGION = 16
 CELLS_PER_DISTRICT = 10000  # 100x100 grid
 SPACE_PER_CELL = 1000.0  # cubic units
 
 # Resource Parameters
-DAILY_ONE_PRODUCTION = 1.0  # "1"s produced per person per day
+DAILY_ONE_PRODUCTION = 2.0  # "1"s produced per person per day
 NUTRITION_REQUIREMENT = 1.0  # nutrition needed per person per day
 STARVATION_THRESHOLD = 0.3  # below this, person starts dying
 
