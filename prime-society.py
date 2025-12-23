@@ -74,7 +74,20 @@ REGION_MARKET_MIN_POP = 10
 MIN_PROFIT_MARGIN = 0.1
 MARKET_DEMAND_LOOKBACK_DAYS = 14
 MIN_MARKET_DEMAND = 0.5
-STARTUP_STAPLE_PRODUCTS = (2, 3, 5)
+COMPETITION_COST_BASE = 0.2
+INNOVATION_COST_BASE = 0.15
+ENTRY_COST_MULTIPLIER_BASE = 1.0
+BASE_ENTRY_CHANCE = 0.02
+MIN_ENTRY_CHANCE = 0.002
+INVESTMENT_SENTIMENT_BASE = 0.5
+STOCK_OPTION_DISCOUNT = 0.15
+INVESTMENT_COOLDOWN_DAYS = 30
+MAX_INVESTORS_PER_ROUND = 25
+MAX_INVESTMENT_FRACTION = 0.1
+COMPETENCY_SALARY_WEIGHT = 0.04
+KNOWLEDGE_SALARY_BONUS = 2.5
+JOB_SWITCH_THRESHOLD = 0.15
+JOB_SWITCH_COOLDOWN_DAYS = 30
 
 # Cultural Dynamics Parameters
 CULTURE_DIM = 6
@@ -309,6 +322,11 @@ class Person:
        # Derived attributes
        self.intelligence = self._calculate_intelligence()
        self.charisma = self._calculate_charisma()
+
+       # Investment behavior
+       self.investment_appetite = self._calculate_investment_appetite()
+       self.investment_sentiment = self.investment_appetite
+       self.last_job_change_day = 0
        
        # Knowledge and skills
        self.known_primes: Set[int] = {2}  # Everyone starts knowing "2"
@@ -397,6 +415,47 @@ class Person:
        happiness_bonus = self.happiness * 0.1
        health_bonus = self.health * 0.1
        return max(0, min(100, base + diplomatic_bonus + social_bonus + happiness_bonus + health_bonus))
+
+   def _calculate_investment_appetite(self) -> float:
+       """Estimate baseline investment appetite from traits"""
+       ambitious = self.traits[Trait.HUMBLE_AMBITIOUS] / 100
+       progressive = self.traits[Trait.CONSERVATIVE_PROGRESSIVE] / 100
+       materialist = self.traits[Trait.MATERIALIST_SPIRITUAL] / 100
+       impulsive = self.traits[Trait.REFLECTIVE_IMPULSIVE] / 100
+       appetite = 0.5 + ambitious * 0.2 + progressive * 0.15 + materialist * 0.1 + impulsive * 0.05
+       return max(0.05, min(0.95, appetite))
+
+   def update_investment_sentiment(self, world: 'World'):
+       """Blend personal appetite with regional sentiment"""
+       params = world.get_cultural_params(self.location.region)
+       region_sentiment = params.get('investment_sentiment', INVESTMENT_SENTIMENT_BASE)
+       target = 0.6 * self.investment_appetite + 0.4 * region_sentiment
+       self.investment_sentiment += (target - self.investment_sentiment) * 0.1
+
+   def apply_training_boost(self, base_boost: float):
+       """Apply sponsored learning progress without energy cost"""
+       if base_boost <= 0:
+           return
+       max_known = max(self.known_primes) if self.known_primes else 1
+       next_prime = max_known + 1
+       while not is_prime(next_prime):
+           next_prime += 1
+
+       # Ensure prerequisites are met
+       for p in range(2, next_prime):
+           if is_prime(p) and p not in self.known_primes:
+               return
+
+       if next_prime not in self.learning_progress:
+           self.learning_progress[next_prime] = 0
+
+       daily_progress = base_boost * (self.intelligence / 100)
+       self.learning_progress[next_prime] += daily_progress
+
+       difficulty = get_prime_position(next_prime) ** 2
+       if self.learning_progress[next_prime] >= difficulty:
+           self.known_primes.add(next_prime)
+           del self.learning_progress[next_prime]
    
    def age_up(self):
        """Age by one day"""
@@ -426,6 +485,7 @@ class Person:
            return
 
        self._ensure_biological_params()
+       self.update_investment_sentiment(world)
        
        self.age_up()
        if not self.is_alive:
@@ -575,6 +635,12 @@ class Person:
            self.health_resilience = 1.0
        if not hasattr(self, 'life_expectancy_days'):
            self.life_expectancy_days = BASE_LIFE_EXPECTANCY * 365
+       if not hasattr(self, 'investment_appetite'):
+           self.investment_appetite = self._calculate_investment_appetite()
+       if not hasattr(self, 'investment_sentiment'):
+           self.investment_sentiment = self.investment_appetite
+       if not hasattr(self, 'last_job_change_day'):
+           self.last_job_change_day = 0
 
 class Company:
    """Economic entity that employs people and produces goods"""
@@ -612,6 +678,11 @@ class Company:
        # Market position
        self.reputation = 0.0
        self.market_share = 0.0
+
+       # Financing
+       self.shares_outstanding = 1000.0
+       self.shareholders: Dict[str, float] = {}
+       self.last_funding_day = -INVESTMENT_COOLDOWN_DAYS
    
    def update_collective_knowledge(self):
        """Update company's collective knowledge from employees"""
@@ -695,6 +766,21 @@ class Company:
        self.capital = 0
        self.inventory = {}
        self.is_bankrupt = True
+
+   def ensure_financial_params(self):
+       """Ensure financing attributes exist (for older checkpoints)."""
+       if not hasattr(self, 'shares_outstanding'):
+           self.shares_outstanding = 1000.0
+       if not hasattr(self, 'shareholders'):
+           self.shareholders = {}
+       if not hasattr(self, 'last_funding_day'):
+           self.last_funding_day = -INVESTMENT_COOLDOWN_DAYS
+
+   def estimate_stock_price(self) -> float:
+       """Estimate a simple stock price from capital and size."""
+       base = self.capital + len(self.employees) * 10
+       price = base / max(1.0, self.shares_outstanding)
+       return max(0.5, price * (1 + self.reputation / 200))
 
 class Building:
    """Physical structure in the world"""
@@ -945,10 +1031,15 @@ class CulturalDynamics:
            'min_profit_margin': MIN_PROFIT_MARGIN,
            'max_company_size': MAX_COMPANY_SIZE,
            'hiring_capital_days': HIRING_CAPITAL_DAYS,
-           'base_salary': BASE_SALARY
+           'base_salary': BASE_SALARY,
+           'competition_cost': COMPETITION_COST_BASE,
+           'innovation_cost': INNOVATION_COST_BASE,
+           'entry_cost_multiplier': ENTRY_COST_MULTIPLIER_BASE,
+           'entry_chance': BASE_ENTRY_CHANCE,
+           'investment_sentiment': INVESTMENT_SENTIMENT_BASE
        }
        self.params_by_region: Dict[int, Dict[str, float]] = {}
-       self.feature_dim = 5
+       self.feature_dim = 7
        self.use_torch = TORCH_AVAILABLE
        if self.use_torch:
            if GLOBAL_SEED is not None:
@@ -956,7 +1047,7 @@ class CulturalDynamics:
            self.model = nn.Sequential(
                nn.Linear(CULTURE_DIM + self.feature_dim, 16),
                nn.Tanh(),
-               nn.Linear(16, 4)
+               nn.Linear(16, 8)
            )
            for param in self.model.parameters():
                if param.dim() > 1:
@@ -965,8 +1056,8 @@ class CulturalDynamics:
        else:
            logger.warning("PyTorch not available - cultural dynamics will use a simple fallback model")
            self.model = None
-           self.weights = np.random.normal(0, 0.05, size=(CULTURE_DIM + self.feature_dim, 4))
-           self.bias = np.zeros(4, dtype=float)
+           self.weights = np.random.normal(0, 0.05, size=(CULTURE_DIM + self.feature_dim, 8))
+           self.bias = np.zeros(8, dtype=float)
            self.region_culture = np.random.normal(0, 0.05, size=(WORLD_REGIONS, CULTURE_DIM))
 
    def _build_features(self, region_stats: Dict[int, Dict[str, float]]):
@@ -979,13 +1070,17 @@ class CulturalDynamics:
            avg_happiness = stats.get('avg_happiness', 0.0)
            gini = stats.get('gini', 0.0)
            starvation_rate = stats.get('starvation_rate', 0.0)
+           employment_rate = stats.get('employment_rate', 0.0)
+           company_density = stats.get('company_density', 0.0)
 
            pop_norm = math.log1p(population) / pop_norm_denom if pop_norm_denom > 0 else 0.0
            res_norm = avg_resources / (avg_resources + 500) if avg_resources > 0 else 0.0
            happ_norm = avg_happiness / 100
            gini_norm = min(1.0, max(0.0, gini))
            starv_norm = min(1.0, max(0.0, starvation_rate))
-           features.append([pop_norm, res_norm, happ_norm, 1 - gini_norm, 1 - starv_norm])
+           comp_norm = company_density / (company_density + 0.02) if company_density > 0 else 0.0
+           features.append([pop_norm, res_norm, happ_norm, 1 - gini_norm, 1 - starv_norm,
+                            min(1.0, max(0.0, employment_rate)), comp_norm])
        return features
 
    def update(self, region_stats: Dict[int, Dict[str, float]]):
@@ -1024,19 +1119,37 @@ class CulturalDynamics:
            max_size = self.base_params['max_company_size'] * (1 + swing * outputs[:, 1])
            hiring_days = self.base_params['hiring_capital_days'] * (1 + swing * outputs[:, 2])
            salary = self.base_params['base_salary'] * (1 + swing * outputs[:, 3])
+           competition_cost = self.base_params['competition_cost'] * (1 + swing * outputs[:, 4])
+           innovation_cost = self.base_params['innovation_cost'] * (1 + swing * outputs[:, 5])
+           entry_dynamics = self.base_params['entry_cost_multiplier'] * (1 + swing * outputs[:, 6])
+           entry_chance = self.base_params['entry_chance'] * (1 + swing * outputs[:, 6])
+           investment_sentiment = self.base_params['investment_sentiment'] * (1 + swing * outputs[:, 7])
 
            margin = torch.clamp(margin, min=self.base_params['min_profit_margin'] * 0.5,
                                 max=self.base_params['min_profit_margin'] * 3)
            max_size = torch.clamp(max_size, min=50, max=self.base_params['max_company_size'] * 3)
            hiring_days = torch.clamp(hiring_days, min=2, max=self.base_params['hiring_capital_days'] * 3)
            salary = torch.clamp(salary, min=0.5, max=self.base_params['base_salary'] * 3)
+           competition_cost = torch.clamp(competition_cost, min=self.base_params['competition_cost'] * 0.5,
+                                          max=self.base_params['competition_cost'] * 3)
+           innovation_cost = torch.clamp(innovation_cost, min=self.base_params['innovation_cost'] * 0.5,
+                                         max=self.base_params['innovation_cost'] * 3)
+           entry_dynamics = torch.clamp(entry_dynamics, min=0.5, max=2.5)
+           entry_chance = torch.clamp(entry_chance, min=MIN_ENTRY_CHANCE,
+                                      max=self.base_params['entry_chance'] * 3)
+           investment_sentiment = torch.clamp(investment_sentiment, min=0.05, max=0.95)
 
            for region in range(WORLD_REGIONS):
                self.params_by_region[region] = {
                    'min_profit_margin': float(margin[region]),
                    'max_company_size': int(round(float(max_size[region]))),
                    'hiring_capital_days': int(round(float(hiring_days[region]))),
-                   'base_salary': float(salary[region])
+                   'base_salary': float(salary[region]),
+                   'competition_cost': float(competition_cost[region]),
+                   'innovation_cost': float(innovation_cost[region]),
+                   'entry_cost_multiplier': float(entry_dynamics[region]),
+                   'entry_chance': float(entry_chance[region]),
+                   'investment_sentiment': float(investment_sentiment[region])
                }
        else:
            inputs = np.concatenate([self.region_culture, features], axis=1)
@@ -1046,19 +1159,36 @@ class CulturalDynamics:
            max_size = self.base_params['max_company_size'] * (1 + swing * outputs[:, 1])
            hiring_days = self.base_params['hiring_capital_days'] * (1 + swing * outputs[:, 2])
            salary = self.base_params['base_salary'] * (1 + swing * outputs[:, 3])
+           competition_cost = self.base_params['competition_cost'] * (1 + swing * outputs[:, 4])
+           innovation_cost = self.base_params['innovation_cost'] * (1 + swing * outputs[:, 5])
+           entry_dynamics = self.base_params['entry_cost_multiplier'] * (1 + swing * outputs[:, 6])
+           entry_chance = self.base_params['entry_chance'] * (1 + swing * outputs[:, 6])
+           investment_sentiment = self.base_params['investment_sentiment'] * (1 + swing * outputs[:, 7])
 
            margin = np.clip(margin, self.base_params['min_profit_margin'] * 0.5,
                             self.base_params['min_profit_margin'] * 3)
            max_size = np.clip(max_size, 50, self.base_params['max_company_size'] * 3)
            hiring_days = np.clip(hiring_days, 2, self.base_params['hiring_capital_days'] * 3)
            salary = np.clip(salary, 0.5, self.base_params['base_salary'] * 3)
+           competition_cost = np.clip(competition_cost, self.base_params['competition_cost'] * 0.5,
+                                      self.base_params['competition_cost'] * 3)
+           innovation_cost = np.clip(innovation_cost, self.base_params['innovation_cost'] * 0.5,
+                                     self.base_params['innovation_cost'] * 3)
+           entry_dynamics = np.clip(entry_dynamics, 0.5, 2.5)
+           entry_chance = np.clip(entry_chance, MIN_ENTRY_CHANCE, self.base_params['entry_chance'] * 3)
+           investment_sentiment = np.clip(investment_sentiment, 0.05, 0.95)
 
            for region in range(WORLD_REGIONS):
                self.params_by_region[region] = {
                    'min_profit_margin': float(margin[region]),
                    'max_company_size': int(round(max_size[region])),
                    'hiring_capital_days': int(round(hiring_days[region])),
-                   'base_salary': float(salary[region])
+                   'base_salary': float(salary[region]),
+                   'competition_cost': float(competition_cost[region]),
+                   'innovation_cost': float(innovation_cost[region]),
+                   'entry_cost_multiplier': float(entry_dynamics[region]),
+                   'entry_chance': float(entry_chance[region]),
+                   'investment_sentiment': float(investment_sentiment[region])
                }
 
    def get_params(self, region: int) -> Dict[str, float]:
@@ -1240,6 +1370,8 @@ class World:
        happiness_sum: Dict[int, float] = defaultdict(float)
        starving_count: Dict[int, int] = defaultdict(int)
        population_count: Dict[int, int] = defaultdict(int)
+       working_age_count: Dict[int, int] = defaultdict(int)
+       employed_count: Dict[int, int] = defaultdict(int)
 
        for person in self.people.values():
            if not person.is_alive:
@@ -1248,6 +1380,10 @@ class World:
            population_count[region] += 1
            resource_buckets[region].append(person.resources)
            happiness_sum[region] += person.happiness
+           if person.age >= 16 * 365:
+               working_age_count[region] += 1
+               if person.employer:
+                   employed_count[region] += 1
            if person.nutrition_level < STARVATION_THRESHOLD:
                starving_count[region] += 1
 
@@ -1259,12 +1395,17 @@ class World:
            avg_happiness = happiness_sum.get(region, 0.0) / population if population else 0.0
            gini = self._calculate_gini(resources) if resources else 0.0
            starvation_rate = (starving_count.get(region, 0) / population) if population else 0.0
+           working_age = working_age_count.get(region, 0)
+           employment_rate = (employed_count.get(region, 0) / working_age) if working_age else 0.0
+           company_density = (self._companies_by_region.get(region, 0) / population) if population else 0.0
            stats[region] = {
                'population': population,
                'avg_resources': avg_resources,
                'avg_happiness': avg_happiness,
                'gini': gini,
-               'starvation_rate': starvation_rate
+               'starvation_rate': starvation_rate,
+               'employment_rate': employment_rate,
+               'company_density': company_density
            }
        return stats
 
@@ -1276,6 +1417,88 @@ class World:
    def get_cultural_params(self, region: int) -> Dict[str, float]:
        """Get current cultural parameters for a region."""
        return self.culture.get_params(region)
+
+   def _estimate_competency(self, person: Person) -> float:
+       """Estimate a productivity score for salary offers."""
+       knowledge_score = len(person.known_primes) * 0.6
+       intelligence_score = (person.intelligence / 100) * 2
+       charisma_score = person.charisma / 100
+       health_score = person.health / 100
+       return knowledge_score + intelligence_score + charisma_score + health_score
+
+   def _calculate_salary_offer(self, person: Person, company: Company) -> float:
+       """Compute a market-aware salary offer for a person."""
+       cultural_params = self.get_cultural_params(company.location.region)
+       local_stats = self.region_stats.get(company.location.region, {})
+       employment_rate = local_stats.get('employment_rate', 0.0)
+       market_pressure = 1 + (employment_rate - 0.5) * 0.6
+       market_pressure = max(0.7, min(1.4, market_pressure))
+
+       competency = self._estimate_competency(person)
+       new_knowledge = person.known_primes - company.collective_knowledge
+       salary = cultural_params['base_salary'] * (1 + competency * COMPETENCY_SALARY_WEIGHT)
+       salary += len(new_knowledge) * KNOWLEDGE_SALARY_BONUS
+       salary *= market_pressure
+       return max(cultural_params['base_salary'] * 0.5, salary)
+
+   def _calculate_entry_chance(self, region: int, cultural_params: Dict[str, float]) -> float:
+       """Determine entry probability based on local economy conditions."""
+       local_stats = self.region_stats.get(region, {})
+       employment_rate = local_stats.get('employment_rate', 0.0)
+       company_density = local_stats.get('company_density', 0.0)
+       saturation = min(0.9, company_density * 3)
+       opportunity = (1 - saturation) * (0.6 + (1 - employment_rate) * 0.4)
+       chance = cultural_params['entry_chance'] * opportunity
+       return max(MIN_ENTRY_CHANCE, min(chance, cultural_params['entry_chance'] * 3))
+
+   def _seek_investment(self, company: Company, cultural_params: Dict[str, float], funding_need: float):
+       """Raise capital via discounted stock options from local investors."""
+       if funding_need <= 0:
+           return
+       company.ensure_financial_params()
+       if self.current_day - company.last_funding_day < INVESTMENT_COOLDOWN_DAYS:
+           return
+
+       region = company.location.region
+       local_people = [
+           p for p in self.people.values()
+           if p.is_alive and p.location.region == region and p.resources > 10
+       ]
+       if not local_people:
+           return
+
+       offer_price = company.estimate_stock_price() * (1 - STOCK_OPTION_DISCOUNT)
+       if offer_price <= 0:
+           return
+
+       region_sentiment = cultural_params.get('investment_sentiment', INVESTMENT_SENTIMENT_BASE)
+       target_product = max(company.production_targets) if company.production_targets else 0
+       risk_profile = 0.7 if target_product >= 7 else 0.3
+       company_quality = 0.5 + min(0.4, len(company.employees) / 50) + min(0.3, company.reputation / 100)
+       company_quality += min(0.3, company.capital / 10000)
+       company_quality = max(0.1, min(1.5, company_quality))
+
+       investors = random.sample(local_people, min(MAX_INVESTORS_PER_ROUND, len(local_people)))
+       starting_need = funding_need
+       for person in investors:
+           if funding_need <= 0:
+               break
+           risk_tolerance = (person.traits[Trait.CONSERVATIVE_PROGRESSIVE] + 100) / 200
+           alignment = 1 - abs(risk_tolerance - risk_profile)
+           invest_prob = person.investment_sentiment * region_sentiment * alignment * company_quality
+           if random.random() < invest_prob:
+               invest_amount = min(person.resources * MAX_INVESTMENT_FRACTION, funding_need)
+               if invest_amount < offer_price:
+                   continue
+               shares = invest_amount / offer_price
+               person.resources -= invest_amount
+               company.capital += invest_amount
+               company.shareholders[person.id] = company.shareholders.get(person.id, 0) + shares
+               company.shares_outstanding += shares
+               funding_need -= invest_amount
+
+       if funding_need < starting_need:
+           company.last_funding_day = self.current_day
 
    def _seed_companies(self):
        """Bootstrap a small number of companies to start market activity"""
@@ -1317,10 +1540,7 @@ class World:
            if margin < min_profit_margin:
                continue
            demand = self.market.get_recent_volume(number, MARKET_DEMAND_LOOKBACK_DAYS)
-           min_demand = MIN_MARKET_DEMAND
-           if self.current_day <= STARTUP_WELLBEING_DAYS and number in STARTUP_STAPLE_PRODUCTS:
-               min_demand = 0.0
-           if demand < min_demand:
+           if demand < MIN_MARKET_DEMAND:
                continue
            score = margin * (1 + demand)
            if score > best_score:
@@ -1330,22 +1550,21 @@ class World:
 
    def _evaluate_company_start(self, founder: Person) -> Optional[int]:
        """Check if the market can support a new company and return a target product"""
-       if founder.resources < START_COMPANY_RESOURCE_THRESHOLD:
-           return None
-
        global_limit = max(3, len(self.people) // GLOBAL_COMPANY_POP_RATIO)
        if len(self.companies) >= global_limit:
            return None
 
        region = founder.location.region
+       cultural_params = self.get_cultural_params(region)
+       entry_threshold = START_COMPANY_RESOURCE_THRESHOLD * cultural_params['entry_cost_multiplier']
+       if founder.resources < entry_threshold:
+           return None
        local_population = self._population_by_region.get(region, 0)
        local_companies = self._companies_by_region.get(region, 0)
        if local_population >= REGION_MARKET_MIN_POP:
            local_limit = max(1, local_population // REGION_COMPANY_POP_RATIO)
            if local_companies >= local_limit:
                return None
-
-       cultural_params = self.get_cultural_params(region)
        return self._find_best_startup_product(founder.known_primes,
                                               cultural_params['min_profit_margin'])
    
@@ -1456,6 +1675,19 @@ class World:
        for company in list(self.companies.values()):
            if company.is_bankrupt:
                continue
+           company.ensure_financial_params()
+           cultural_params = self.get_cultural_params(company.location.region)
+           local_stats = self.region_stats.get(company.location.region, {})
+           competition_pressure = 1 + local_stats.get('company_density', 0.0) * 2
+           competition_cost = cultural_params['competition_cost'] * len(company.employees) * competition_pressure
+           company.capital -= competition_cost
+           if company.employees and company.capital > 0:
+               innovation_cost = cultural_params['innovation_cost'] * len(company.employees)
+               if company.capital > innovation_cost:
+                   company.capital -= innovation_cost
+                   training_boost = (innovation_cost / max(1, len(company.employees))) * 5
+                   for employee in random.sample(company.employees, min(3, len(company.employees))):
+                       employee.apply_training_boost(training_boost)
            if company.employees:
                # Decide what to produce based on market prices
                profitable_products = []
@@ -1486,6 +1718,10 @@ class World:
                
                # Pay salaries
                company.pay_salaries()
+               salary_bill = sum(e.salary for e in company.employees)
+               buffer_target = salary_bill * cultural_params['hiring_capital_days']
+               if company.capital < buffer_target * 0.6:
+                   self._seek_investment(company, cultural_params, buffer_target - company.capital)
        
        # Job market - unemployed look for work
        unemployed = [p for p in self.people.values() 
@@ -1493,7 +1729,9 @@ class World:
        
        for person in unemployed[:min(1000, len(unemployed))]:  # Limit to prevent slowdown
            # Look for job or start company
-           if person.resources > START_COMPANY_RESOURCE_THRESHOLD and random.random() < 0.02:
+           cultural_params = self.get_cultural_params(person.location.region)
+           entry_chance = self._calculate_entry_chance(person.location.region, cultural_params)
+           if random.random() < entry_chance:
                # Start a company
                target_product = self._evaluate_company_start(person)
                if target_product is not None:
@@ -1506,14 +1744,43 @@ class World:
                # Look for employment
                for company in random.sample(list(self.companies.values()), 
                                            min(5, len(self.companies))):
-                   cultural_params = self.get_cultural_params(company.location.region)
-                   if len(company.employees) < cultural_params['max_company_size']:  # Company size limit
+                   company_params = self.get_cultural_params(company.location.region)
+                   if len(company.employees) < company_params['max_company_size']:  # Company size limit
                        # Check if person's knowledge is useful
-                       new_knowledge = person.known_primes - company.collective_knowledge
-                       salary = cultural_params['base_salary'] + len(new_knowledge) * 4
-                       if company.capital > salary * cultural_params['hiring_capital_days']:  # Can afford for N days
+                       salary = self._calculate_salary_offer(person, company)
+                       if company.capital > salary * company_params['hiring_capital_days']:  # Can afford for N days
                            company.hire(person, salary)
+                           person.last_job_change_day = self.current_day
                            break
+
+       # Job switching for better offers
+       employed = [p for p in self.people.values()
+                   if p.is_alive and p.age >= 16 * 365 and p.employer]
+       for person in random.sample(employed, min(500, len(employed))):
+           if self.current_day - person.last_job_change_day < JOB_SWITCH_COOLDOWN_DAYS:
+               continue
+           switch_drive = (person.traits[Trait.HUMBLE_AMBITIOUS] + 100) / 200
+           if random.random() > switch_drive:
+               continue
+           best_offer = None
+           best_company = None
+           for company in random.sample(list(self.companies.values()),
+                                        min(3, len(self.companies))):
+               if company.is_bankrupt or company == person.employer:
+                   continue
+               cultural_params = self.get_cultural_params(company.location.region)
+               if len(company.employees) >= cultural_params['max_company_size']:
+                   continue
+               salary = self._calculate_salary_offer(person, company)
+               if company.capital <= salary * cultural_params['hiring_capital_days']:
+                   continue
+               if salary > person.salary * (1 + JOB_SWITCH_THRESHOLD):
+                   if best_offer is None or salary > best_offer:
+                       best_offer = salary
+                       best_company = company
+           if best_company and best_offer:
+               best_company.hire(person, best_offer)
+               person.last_job_change_day = self.current_day
    
    def _phase_market(self):
        """Market transactions and price discovery"""
