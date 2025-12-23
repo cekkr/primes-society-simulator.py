@@ -6,6 +6,14 @@ A multi-generational socio-economic simulation where nutrition comes from prime 
 
 import numpy as np
 import random
+try:
+   import torch
+   import torch.nn as nn
+   TORCH_AVAILABLE = True
+except ImportError:
+   torch = None
+   nn = None
+   TORCH_AVAILABLE = False
 import pickle
 import zlib
 import heapq
@@ -44,6 +52,11 @@ HEALTH_RECOVERY_RATE = 0.5
 STARVATION_DAMAGE_BASE = 0.5
 STARVATION_DAMAGE_SCALE = 2.0
 
+# Genetic Parameters
+GENETIC_MUTATION_RATE = 0.05
+GENE_MIN = 0.8
+GENE_MAX = 1.2
+
 # Economic Parameters
 PRIME_DISCOVERY_COST_MULTIPLIER = 50
 PRIME_DISCOVERY_TIME_MULTIPLIER = 1
@@ -62,6 +75,13 @@ MIN_PROFIT_MARGIN = 0.1
 MARKET_DEMAND_LOOKBACK_DAYS = 14
 MIN_MARKET_DEMAND = 0.5
 STARTUP_STAPLE_PRODUCTS = (2, 3, 5)
+
+# Cultural Dynamics Parameters
+CULTURE_DIM = 6
+CULTURE_COMPETITION_RATE = 0.05
+CULTURE_DRIFT = 0.01
+CULTURE_TOP_FRACTION = 0.2
+CULTURE_PARAM_SWING = 0.6
 
 # Social Parameters
 TRAIT_INHERITANCE_VARIANCE = 20
@@ -119,6 +139,7 @@ CHECKPOINT_DIR = "checkpoints"
 
 # Logging Configuration
 CURRENT_DAY = 0
+GLOBAL_SEED = None
 
 def set_current_day(day: int) -> None:
    """Update the day used in log formatting."""
@@ -275,6 +296,15 @@ class Person:
            self.traits = self._inherit_traits(parents)
        else:
            self.traits = self._random_traits()
+
+       # Genetics
+       if parents:
+           genetics = self._inherit_genetics(parents)
+       else:
+           genetics = self._random_genetics()
+       self.nutrition_efficiency = genetics['nutrition_efficiency']
+       self.starvation_resistance = genetics['starvation_resistance']
+       self.health_resilience = genetics['health_resilience']
        
        # Derived attributes
        self.intelligence = self._calculate_intelligence()
@@ -329,6 +359,28 @@ class Person:
            variation = random.uniform(-TRAIT_INHERITANCE_VARIANCE, TRAIT_INHERITANCE_VARIANCE)
            traits[trait] = max(-100, min(100, parent_avg + variation))
        return traits
+
+   def _random_genetics(self) -> Dict[str, float]:
+       """Generate random genetic traits"""
+       return {
+           'nutrition_efficiency': random.uniform(GENE_MIN, GENE_MAX),
+           'starvation_resistance': random.uniform(GENE_MIN, GENE_MAX),
+           'health_resilience': random.uniform(GENE_MIN, GENE_MAX)
+       }
+
+   def _inherit_genetics(self, parents: Tuple['Person', 'Person']) -> Dict[str, float]:
+       """Inherit genetic traits from parents with slight mutation"""
+       def inherit(attr: str) -> float:
+           parent_avg = (getattr(parents[0], attr, 1.0) + getattr(parents[1], attr, 1.0)) / 2
+           if random.random() < GENETIC_MUTATION_RATE:
+               parent_avg += random.uniform(-0.05, 0.05)
+           return max(GENE_MIN, min(GENE_MAX, parent_avg))
+
+       return {
+           'nutrition_efficiency': inherit('nutrition_efficiency'),
+           'starvation_resistance': inherit('starvation_resistance'),
+           'health_resilience': inherit('health_resilience')
+       }
    
    def _calculate_intelligence(self) -> float:
        """Calculate intelligence from traits"""
@@ -372,6 +424,8 @@ class Person:
        """Execute daily activities"""
        if not self.is_alive:
            return
+
+       self._ensure_biological_params()
        
        self.age_up()
        if not self.is_alive:
@@ -381,16 +435,17 @@ class Person:
        self.energy = 100 - (self.age / (365 * 100)) * 20  # Age reduces energy
        
        # Consume nutrition
-       self.nutrition_level -= NUTRITION_REQUIREMENT * self.metabolism
+       daily_need = (NUTRITION_REQUIREMENT * self.metabolism) / self.nutrition_efficiency
+       self.nutrition_level -= daily_need
        if self.nutrition_level < 0:
            self.nutrition_level = 0
        if self.nutrition_level < STARVATION_THRESHOLD:
            deficit = STARVATION_THRESHOLD - self.nutrition_level
            starvation_damage = STARVATION_DAMAGE_BASE + deficit * STARVATION_DAMAGE_SCALE
-           self.health -= starvation_damage * self.metabolism
+           self.health -= starvation_damage * self.metabolism / self.starvation_resistance
            self.stress += 6 + deficit * 8
        elif self.nutrition_level >= NUTRITION_REQUIREMENT:
-           self.health = min(100, self.health + HEALTH_RECOVERY_RATE)
+           self.health = min(100, self.health + HEALTH_RECOVERY_RATE * self.health_resilience)
        
        # Work if employed
        if self.employer and self.age >= 16 * 365:
@@ -507,6 +562,19 @@ class Person:
        self.happiness = max(0, min(100, 
            base + nutrition_factor + health_factor + stress_factor + social_factor + resource_factor
        ))
+
+   def _ensure_biological_params(self):
+       """Ensure derived biological parameters exist (for older checkpoints)."""
+       if not hasattr(self, 'metabolism'):
+           self.metabolism = 1.0
+       if not hasattr(self, 'nutrition_efficiency'):
+           self.nutrition_efficiency = 1.0
+       if not hasattr(self, 'starvation_resistance'):
+           self.starvation_resistance = 1.0
+       if not hasattr(self, 'health_resilience'):
+           self.health_resilience = 1.0
+       if not hasattr(self, 'life_expectancy_days'):
+           self.life_expectancy_days = BASE_LIFE_EXPECTANCY * 365
 
 class Company:
    """Economic entity that employs people and produces goods"""
@@ -868,6 +936,134 @@ class Market:
            return 0.0
        return sum(order[1] for order in self.order_book[number]['asks'])
 
+class CulturalDynamics:
+   """Tracks region-level cultural drift and adjusts economic parameters."""
+
+   def __init__(self, world: 'World'):
+       self.world = world
+       self.base_params = {
+           'min_profit_margin': MIN_PROFIT_MARGIN,
+           'max_company_size': MAX_COMPANY_SIZE,
+           'hiring_capital_days': HIRING_CAPITAL_DAYS,
+           'base_salary': BASE_SALARY
+       }
+       self.params_by_region: Dict[int, Dict[str, float]] = {}
+       self.feature_dim = 5
+       self.use_torch = TORCH_AVAILABLE
+       if self.use_torch:
+           if GLOBAL_SEED is not None:
+               torch.manual_seed(GLOBAL_SEED)
+           self.model = nn.Sequential(
+               nn.Linear(CULTURE_DIM + self.feature_dim, 16),
+               nn.Tanh(),
+               nn.Linear(16, 4)
+           )
+           for param in self.model.parameters():
+               if param.dim() > 1:
+                   nn.init.normal_(param, mean=0.0, std=0.05)
+           self.region_culture = torch.randn(WORLD_REGIONS, CULTURE_DIM) * 0.05
+       else:
+           logger.warning("PyTorch not available - cultural dynamics will use a simple fallback model")
+           self.model = None
+           self.weights = np.random.normal(0, 0.05, size=(CULTURE_DIM + self.feature_dim, 4))
+           self.bias = np.zeros(4, dtype=float)
+           self.region_culture = np.random.normal(0, 0.05, size=(WORLD_REGIONS, CULTURE_DIM))
+
+   def _build_features(self, region_stats: Dict[int, Dict[str, float]]):
+       features = []
+       pop_norm_denom = math.log1p(max(1, INITIAL_POPULATION))
+       for region in range(WORLD_REGIONS):
+           stats = region_stats.get(region, {})
+           population = stats.get('population', 0)
+           avg_resources = stats.get('avg_resources', 0.0)
+           avg_happiness = stats.get('avg_happiness', 0.0)
+           gini = stats.get('gini', 0.0)
+           starvation_rate = stats.get('starvation_rate', 0.0)
+
+           pop_norm = math.log1p(population) / pop_norm_denom if pop_norm_denom > 0 else 0.0
+           res_norm = avg_resources / (avg_resources + 500) if avg_resources > 0 else 0.0
+           happ_norm = avg_happiness / 100
+           gini_norm = min(1.0, max(0.0, gini))
+           starv_norm = min(1.0, max(0.0, starvation_rate))
+           features.append([pop_norm, res_norm, happ_norm, 1 - gini_norm, 1 - starv_norm])
+       return features
+
+   def update(self, region_stats: Dict[int, Dict[str, float]]):
+       features = self._build_features(region_stats)
+       if self.use_torch:
+           features_t = torch.tensor(features, dtype=torch.float32)
+           fitness = (0.4 * features_t[:, 2] + 0.4 * features_t[:, 1] +
+                      0.1 * features_t[:, 3] + 0.1 * features_t[:, 4])
+           top_k = max(1, int(WORLD_REGIONS * CULTURE_TOP_FRACTION))
+           _, top_idx = torch.topk(fitness, top_k)
+           target = self.region_culture[top_idx].mean(dim=0)
+           noise = torch.randn_like(self.region_culture) * CULTURE_DRIFT
+           self.region_culture = ((1 - CULTURE_COMPETITION_RATE) * self.region_culture +
+                                  CULTURE_COMPETITION_RATE * target + noise)
+           self._refresh_params(features_t)
+       else:
+           features_np = np.array(features, dtype=float)
+           fitness = (0.4 * features_np[:, 2] + 0.4 * features_np[:, 1] +
+                      0.1 * features_np[:, 3] + 0.1 * features_np[:, 4])
+           top_k = max(1, int(WORLD_REGIONS * CULTURE_TOP_FRACTION))
+           top_idx = np.argsort(fitness)[-top_k:]
+           target = np.mean(self.region_culture[top_idx], axis=0)
+           noise = np.random.normal(0, CULTURE_DRIFT, size=self.region_culture.shape)
+           self.region_culture = ((1 - CULTURE_COMPETITION_RATE) * self.region_culture +
+                                  CULTURE_COMPETITION_RATE * target + noise)
+           self._refresh_params(features_np)
+
+   def _refresh_params(self, features):
+       if self.use_torch:
+           inputs = torch.cat([self.region_culture, features], dim=1)
+           outputs = self.model(inputs)
+           outputs = torch.tanh(outputs)
+           swing = CULTURE_PARAM_SWING
+
+           margin = self.base_params['min_profit_margin'] * (1 + swing * outputs[:, 0])
+           max_size = self.base_params['max_company_size'] * (1 + swing * outputs[:, 1])
+           hiring_days = self.base_params['hiring_capital_days'] * (1 + swing * outputs[:, 2])
+           salary = self.base_params['base_salary'] * (1 + swing * outputs[:, 3])
+
+           margin = torch.clamp(margin, min=self.base_params['min_profit_margin'] * 0.5,
+                                max=self.base_params['min_profit_margin'] * 3)
+           max_size = torch.clamp(max_size, min=50, max=self.base_params['max_company_size'] * 3)
+           hiring_days = torch.clamp(hiring_days, min=2, max=self.base_params['hiring_capital_days'] * 3)
+           salary = torch.clamp(salary, min=0.5, max=self.base_params['base_salary'] * 3)
+
+           for region in range(WORLD_REGIONS):
+               self.params_by_region[region] = {
+                   'min_profit_margin': float(margin[region]),
+                   'max_company_size': int(round(float(max_size[region]))),
+                   'hiring_capital_days': int(round(float(hiring_days[region]))),
+                   'base_salary': float(salary[region])
+               }
+       else:
+           inputs = np.concatenate([self.region_culture, features], axis=1)
+           outputs = np.tanh(inputs @ self.weights + self.bias)
+           swing = CULTURE_PARAM_SWING
+           margin = self.base_params['min_profit_margin'] * (1 + swing * outputs[:, 0])
+           max_size = self.base_params['max_company_size'] * (1 + swing * outputs[:, 1])
+           hiring_days = self.base_params['hiring_capital_days'] * (1 + swing * outputs[:, 2])
+           salary = self.base_params['base_salary'] * (1 + swing * outputs[:, 3])
+
+           margin = np.clip(margin, self.base_params['min_profit_margin'] * 0.5,
+                            self.base_params['min_profit_margin'] * 3)
+           max_size = np.clip(max_size, 50, self.base_params['max_company_size'] * 3)
+           hiring_days = np.clip(hiring_days, 2, self.base_params['hiring_capital_days'] * 3)
+           salary = np.clip(salary, 0.5, self.base_params['base_salary'] * 3)
+
+           for region in range(WORLD_REGIONS):
+               self.params_by_region[region] = {
+                   'min_profit_margin': float(margin[region]),
+                   'max_company_size': int(round(max_size[region])),
+                   'hiring_capital_days': int(round(hiring_days[region])),
+                   'base_salary': float(salary[region])
+               }
+
+   def get_params(self, region: int) -> Dict[str, float]:
+       return self.params_by_region.get(region, self.base_params)
+
 class PoliticalSystem:
    """Handles elections and governance"""
    
@@ -967,6 +1163,7 @@ class World:
        self.market = Market()
        self.market.set_world(self)
        self.political_system = PoliticalSystem()
+       self.culture = CulturalDynamics(self)
        
        # Spatial grid: region -> district -> cells
        self.grid = np.zeros((WORLD_REGIONS, DISTRICTS_PER_REGION, 10, 10), dtype=object)
@@ -999,6 +1196,7 @@ class World:
 
        self._population_by_region: Dict[int, int] = defaultdict(int)
        self._companies_by_region: Dict[int, int] = defaultdict(int)
+       self.region_stats: Dict[int, Dict[str, float]] = {}
        
        # Initialize population
        self._initialize_population()
@@ -1019,20 +1217,65 @@ class World:
            self.add_person(person)
 
        self._refresh_market_cache()
+       self._update_culture()
        self._seed_companies()
        self._refresh_market_cache()
+       self._update_culture()
        logger.info(f"Initialized {INITIAL_POPULATION} people")
 
    def _refresh_market_cache(self):
-    """Update cached population and company counts by region"""
-    self._population_by_region = defaultdict(int)
-    for person in self.people.values():
-        if person.is_alive:
-            self._population_by_region[person.location.region] += 1
-    self._companies_by_region = defaultdict(int)
-    for company in self.companies.values():
-        if company.location and not company.is_bankrupt:
-            self._companies_by_region[company.location.region] += 1
+       """Update cached population and company counts by region"""
+       self._population_by_region = defaultdict(int)
+       for person in self.people.values():
+           if person.is_alive:
+               self._population_by_region[person.location.region] += 1
+       self._companies_by_region = defaultdict(int)
+       for company in self.companies.values():
+           if company.location and not company.is_bankrupt:
+               self._companies_by_region[company.location.region] += 1
+
+   def _collect_region_stats(self) -> Dict[int, Dict[str, float]]:
+       """Aggregate region-level metrics for cultural dynamics."""
+       resource_buckets: Dict[int, List[float]] = defaultdict(list)
+       happiness_sum: Dict[int, float] = defaultdict(float)
+       starving_count: Dict[int, int] = defaultdict(int)
+       population_count: Dict[int, int] = defaultdict(int)
+
+       for person in self.people.values():
+           if not person.is_alive:
+               continue
+           region = person.location.region
+           population_count[region] += 1
+           resource_buckets[region].append(person.resources)
+           happiness_sum[region] += person.happiness
+           if person.nutrition_level < STARVATION_THRESHOLD:
+               starving_count[region] += 1
+
+       stats: Dict[int, Dict[str, float]] = {}
+       for region in range(WORLD_REGIONS):
+           population = population_count.get(region, 0)
+           resources = resource_buckets.get(region, [])
+           avg_resources = sum(resources) / len(resources) if resources else 0.0
+           avg_happiness = happiness_sum.get(region, 0.0) / population if population else 0.0
+           gini = self._calculate_gini(resources) if resources else 0.0
+           starvation_rate = (starving_count.get(region, 0) / population) if population else 0.0
+           stats[region] = {
+               'population': population,
+               'avg_resources': avg_resources,
+               'avg_happiness': avg_happiness,
+               'gini': gini,
+               'starvation_rate': starvation_rate
+           }
+       return stats
+
+   def _update_culture(self):
+       """Refresh regional stats and update cultural parameters."""
+       self.region_stats = self._collect_region_stats()
+       self.culture.update(self.region_stats)
+
+   def get_cultural_params(self, region: int) -> Dict[str, float]:
+       """Get current cultural parameters for a region."""
+       return self.culture.get_params(region)
 
    def _seed_companies(self):
        """Bootstrap a small number of companies to start market activity"""
@@ -1061,7 +1304,7 @@ class World:
        factors = factorize(number)
        return all(prime in known_primes for prime in factors.keys())
 
-   def _find_best_startup_product(self, known_primes: Set[int]) -> Optional[int]:
+   def _find_best_startup_product(self, known_primes: Set[int], min_profit_margin: float) -> Optional[int]:
        """Find a viable product for a new company"""
        best_product = None
        best_score = -float('inf')
@@ -1071,7 +1314,7 @@ class World:
            price = self.market.get_price(number)
            cost = calculate_weight(number)
            margin = price - cost
-           if margin < MIN_PROFIT_MARGIN:
+           if margin < min_profit_margin:
                continue
            demand = self.market.get_recent_volume(number, MARKET_DEMAND_LOOKBACK_DAYS)
            min_demand = MIN_MARKET_DEMAND
@@ -1102,7 +1345,9 @@ class World:
            if local_companies >= local_limit:
                return None
 
-       return self._find_best_startup_product(founder.known_primes)
+       cultural_params = self.get_cultural_params(region)
+       return self._find_best_startup_product(founder.known_primes,
+                                              cultural_params['min_profit_margin'])
    
    def add_person(self, person: Person):
        """Add a person to the world"""
@@ -1162,6 +1407,7 @@ class World:
        set_current_day(self.current_day)
        self.market.start_day()
        self._refresh_market_cache()
+       self._update_culture()
        logger.info(f"Day {self.current_day} - Population: {len(self.people)}")
        
        # Phase 1: Individual activities (40% of processing)
@@ -1260,11 +1506,12 @@ class World:
                # Look for employment
                for company in random.sample(list(self.companies.values()), 
                                            min(5, len(self.companies))):
-                   if len(company.employees) < MAX_COMPANY_SIZE:  # Company size limit
+                   cultural_params = self.get_cultural_params(company.location.region)
+                   if len(company.employees) < cultural_params['max_company_size']:  # Company size limit
                        # Check if person's knowledge is useful
                        new_knowledge = person.known_primes - company.collective_knowledge
-                       salary = BASE_SALARY + len(new_knowledge) * 4
-                       if company.capital > salary * HIRING_CAPITAL_DAYS:  # Can afford for N days
+                       salary = cultural_params['base_salary'] + len(new_knowledge) * 4
+                       if company.capital > salary * cultural_params['hiring_capital_days']:  # Can afford for N days
                            company.hire(person, salary)
                            break
    
@@ -1276,7 +1523,8 @@ class World:
                continue
            
            # Calculate nutrition need with buffer
-           target_level = max(NUTRITION_REQUIREMENT, NUTRITION_BUFFER_TARGET) * person.metabolism
+           target_level = (max(NUTRITION_REQUIREMENT, NUTRITION_BUFFER_TARGET) *
+                           person.metabolism / person.nutrition_efficiency)
            need = target_level - person.nutrition_level
            if need > 0 and person.resources > 0:
                # Find affordable nutrition
@@ -1298,7 +1546,8 @@ class World:
                    # Place buy order
                    market_price = self.market.get_price(best_deal)
                    bid_price = market_price * (1 + MARKET_FRICTION)
-                   nutrition_per_unit = calculate_nutrition(best_deal) * NUTRITION_ABSORPTION_RATE
+                   nutrition_per_unit = (calculate_nutrition(best_deal) *
+                                         NUTRITION_ABSORPTION_RATE * person.nutrition_efficiency)
                    if nutrition_per_unit <= 0:
                        continue
                    desired_units = need / nutrition_per_unit
@@ -1978,6 +2227,8 @@ def main():
    random.seed(args.seed)
    np.random.seed(args.seed)
    logger.info(f"Random seed set to {args.seed}")
+   global GLOBAL_SEED
+   GLOBAL_SEED = args.seed
    
    # Override global settings   
    INITIAL_POPULATION = args.population
