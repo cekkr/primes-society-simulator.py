@@ -88,6 +88,10 @@ COMPETENCY_SALARY_WEIGHT = 0.04
 KNOWLEDGE_SALARY_BONUS = 2.5
 JOB_SWITCH_THRESHOLD = 0.15
 JOB_SWITCH_COOLDOWN_DAYS = 30
+MIGRATION_BASE_RATE = 0.002
+MIGRATION_COST_BASE = 20.0
+MIGRATION_COOLDOWN_DAYS = 90
+MIGRATION_OPPORTUNITY_THRESHOLD = 0.05
 
 # Cultural Dynamics Parameters
 CULTURE_DIM = 6
@@ -332,6 +336,7 @@ class Person:
        self.investment_appetite = self._calculate_investment_appetite()
        self.investment_sentiment = self.investment_appetite
        self.last_job_change_day = 0
+       self.last_migration_day = 0
        
        # Knowledge and skills
        self.known_primes: Set[int] = {2}  # Everyone starts knowing "2"
@@ -646,6 +651,8 @@ class Person:
            self.investment_sentiment = self.investment_appetite
        if not hasattr(self, 'last_job_change_day'):
            self.last_job_change_day = 0
+       if not hasattr(self, 'last_migration_day'):
+           self.last_migration_day = 0
 
 class Company:
    """Economic entity that employs people and produces goods"""
@@ -1437,6 +1444,27 @@ class World:
            return 0.0
        return avg_gdp / avg_population
 
+   def _region_opportunity_score(self, region: int) -> float:
+       """Score regions for migration opportunities."""
+       stats = self.region_stats.get(region, {})
+       avg_resources = stats.get('avg_resources', 0.0)
+       employment_rate = stats.get('employment_rate', 0.0)
+       avg_happiness = stats.get('avg_happiness', 0.0)
+       gini = stats.get('gini', 0.0)
+       starvation_rate = stats.get('starvation_rate', 0.0)
+       population = stats.get('population', 0)
+
+       res_norm = avg_resources / (avg_resources + 300) if avg_resources > 0 else 0.0
+       happiness_norm = avg_happiness / 100
+       equality = 1 - min(1.0, max(0.0, gini))
+       starvation_relief = 1 - min(1.0, max(0.0, starvation_rate))
+       pop_pressure = population / max(1, INITIAL_POPULATION)
+       population_relief = 1 / (1 + pop_pressure * 1.5)
+
+       score = (0.25 * res_norm + 0.25 * employment_rate + 0.2 * happiness_norm +
+                0.15 * equality + 0.1 * starvation_relief + 0.05 * population_relief)
+       return max(0.0, min(1.5, score))
+
    def _calculate_reproduction_modifier(self, person: Person, partner: Optional[Person]) -> float:
        """Combine genetics, knowledge, wellbeing, and economy into a fertility modifier."""
        people = [person] + ([partner] if partner else [])
@@ -1640,6 +1668,20 @@ class World:
        # Add to spatial grid
        loc = person.location
        self.grid[loc.region, loc.district, loc.cell_x, loc.cell_y]['people'].append(person.id)
+
+   def move_person(self, person: Person, new_location: Location):
+       """Move a person to a new location and update spatial grid."""
+       old_loc = person.location
+       if old_loc:
+           cell_people = self.grid[old_loc.region, old_loc.district, old_loc.cell_x, old_loc.cell_y]['people']
+           if person.id in cell_people:
+               cell_people.remove(person.id)
+
+       person.location = new_location
+       self.grid[new_location.region, new_location.district, new_location.cell_x, new_location.cell_y]['people'].append(person.id)
+
+       if person.employer and person.employer.location.region != new_location.region:
+           person.employer.fire(person)
    
    def remove_person(self, person: Person):
        """Remove a person from the world"""
@@ -1948,6 +1990,54 @@ class World:
        # Political system update
        self.political_system.daily_update(self)
 
+       # Migration pressure
+       candidates = [p for p in self.people.values() if p.is_alive and p.age >= 16 * 365]
+       if candidates:
+           sample = random.sample(candidates, min(1500, len(candidates)))
+           for person in sample:
+               if self.current_day - person.last_migration_day < MIGRATION_COOLDOWN_DAYS:
+                   continue
+               if person.resources < MIGRATION_COST_BASE:
+                   continue
+               base_drive = 0.5 + (1 - person.happiness / 100) * 0.6
+               resource_pressure = 1 - min(1.0, person.resources / 500)
+               ambition = (person.traits[Trait.HUMBLE_AMBITIOUS] + 100) / 200
+               drive = base_drive + resource_pressure * 0.4 + ambition * 0.3
+               if person.employer:
+                   drive *= 0.6
+               move_chance = MIGRATION_BASE_RATE * drive
+               if random.random() > move_chance:
+                   continue
+
+               current_region = person.location.region
+               current_score = self._region_opportunity_score(current_region)
+               region_scores = []
+               for region in range(WORLD_REGIONS):
+                   if region == current_region:
+                       continue
+                   score = self._region_opportunity_score(region)
+                   if score >= current_score + MIGRATION_OPPORTUNITY_THRESHOLD:
+                       region_scores.append((score, region))
+               if not region_scores:
+                   continue
+               region_scores.sort(reverse=True)
+               top_regions = region_scores[:5]
+               chosen_region = random.choice([r for _, r in top_regions])
+
+               distance = abs(chosen_region - current_region) / max(1, WORLD_REGIONS - 1)
+               cost = MIGRATION_COST_BASE * (1 + distance * 2)
+               if person.resources < cost:
+                   continue
+               person.resources -= cost
+               new_location = Location(
+                   region=chosen_region,
+                   district=random.randint(0, DISTRICTS_PER_REGION - 1),
+                   cell_x=random.randint(0, 9),
+                   cell_y=random.randint(0, 9)
+               )
+               self.move_person(person, new_location)
+               person.last_migration_day = self.current_day
+       
        # Startup wellbeing support
        if self.current_day <= STARTUP_WELLBEING_DAYS:
            for person in self.people.values():
