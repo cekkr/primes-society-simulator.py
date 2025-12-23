@@ -40,23 +40,23 @@ STARVATION_THRESHOLD = 0.3  # below this, person starts dying
 NUTRITION_ABSORPTION_RATE = 1.0  # nutrition gained per unit consumed
 
 # Economic Parameters
-PRIME_DISCOVERY_COST_MULTIPLIER = 10
+PRIME_DISCOVERY_COST_MULTIPLIER = 50
 PRIME_DISCOVERY_TIME_MULTIPLIER = 1
-ENTROPY_LOSS = 0.05  # production inefficiency
-MARKET_FRICTION = 0.02
+ENTROPY_LOSS = 0.01  # production inefficiency
+MARKET_FRICTION = 0.01
 KNOWLEDGE_DECAY_RATE = 0.01 / 365  # per day if unused
 KNOWLEDGE_TRANSFER_RATE = 1 / 30  # one prime per 30 days of mentoring
 START_COMPANY_RESOURCE_THRESHOLD = 300.0
 BASE_SALARY = 10.0
 HIRING_CAPITAL_DAYS = 15
-MAX_COMPANY_SIZE = 50
+MAX_COMPANY_SIZE = 500
 
 # Social Parameters
 TRAIT_INHERITANCE_VARIANCE = 20
 TRAIT_MUTATION_RATE = 0.1
 RELATIONSHIP_DISTANCE_THRESHOLD = 3  # cells
 RELATIONSHIP_DECAY = 0.01  # per day without interaction
-CHILD_COST = 365  # total cost to raise a child (to do: define value meaning)
+CHILD_COST = 5  # total cost to raise a child (to do: define value meaning)
 MIN_REPRODUCTION_AGE = 16
 MAX_REPRODUCTION_AGE = 55
 BASE_REPRODUCTION_CHANCE = 0.002
