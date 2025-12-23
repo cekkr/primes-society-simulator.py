@@ -862,6 +862,12 @@ class Market:
            return 0.0
        return sum(window) / len(window)
 
+   def get_total_ask_quantity(self, number: int) -> float:
+       """Total available sell quantity for a number"""
+       if number not in self.order_book:
+           return 0.0
+       return sum(order[1] for order in self.order_book[number]['asks'])
+
 class PoliticalSystem:
    """Handles elections and governance"""
    
@@ -1280,8 +1286,9 @@ class World:
                for n in range(1, 10):  # Check first 10 numbers
                    nutrition = calculate_nutrition(n)
                    price = self.market.get_price(n)
+                   available_quantity = self.market.get_total_ask_quantity(n)
                    
-                   if price <= person.resources and nutrition > 0:
+                   if price <= person.resources and nutrition > 0 and available_quantity > 0:
                        efficiency = nutrition / price
                        if efficiency > best_efficiency:
                            best_efficiency = efficiency
@@ -1295,7 +1302,10 @@ class World:
                    if nutrition_per_unit <= 0:
                        continue
                    desired_units = need / nutrition_per_unit
-                   quantity = min(desired_units, person.resources / bid_price, 10)
+                   available_quantity = self.market.get_total_ask_quantity(best_deal)
+                   if available_quantity <= 0:
+                       continue
+                   quantity = min(desired_units, person.resources / bid_price, 10, available_quantity)
                    if quantity <= 0:
                        continue
                    self.market.place_order(best_deal, quantity, bid_price, True, person.id)
