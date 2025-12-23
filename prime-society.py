@@ -34,7 +34,7 @@ CELLS_PER_DISTRICT = 10000  # 100x100 grid
 SPACE_PER_CELL = 1000.0  # cubic units
 
 # Resource Parameters
-DAILY_ONE_PRODUCTION = 2.0  # "1"s produced per person per day
+DAILY_ONE_PRODUCTION = 1.0  # "1"s produced per person per day
 NUTRITION_REQUIREMENT = 1.0  # nutrition needed per person per day
 STARVATION_THRESHOLD = 0.3  # below this, person starts dying
 NUTRITION_ABSORPTION_RATE = 1.0  # nutrition gained per unit consumed
