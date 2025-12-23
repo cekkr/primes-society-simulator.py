@@ -107,6 +107,11 @@ MAX_REPRODUCTION_AGE = 55
 BASE_REPRODUCTION_CHANCE = 0.002
 SINGLE_PARENT_REPRODUCTION_CHANCE = 0.0004
 REPRODUCTION_RELATIONSHIP_THRESHOLD = 20
+BASE_REPRODUCTION_CAP = 0.03
+SINGLE_PARENT_REPRODUCTION_CAP = 0.015
+REPRODUCTION_MODIFIER_MIN = 0.6
+REPRODUCTION_MODIFIER_MAX = 1.6
+GDP_PER_CAPITA_NORM = 2.0
 
 # Life Cycle Parameters
 LIFE_STAGES = {
@@ -1418,6 +1423,66 @@ class World:
        """Get current cultural parameters for a region."""
        return self.culture.get_params(region)
 
+   def _get_recent_gdp_per_capita(self, window: int = 30) -> float:
+       """Estimate recent GDP per capita."""
+       if not self.stats['gdp'] or not self.stats['population']:
+           return 0.0
+       gdp_window = self.stats['gdp'][-window:]
+       pop_window = self.stats['population'][-window:]
+       if not gdp_window or not pop_window:
+           return 0.0
+       avg_gdp = sum(gdp_window) / len(gdp_window)
+       avg_population = sum(pop_window) / len(pop_window)
+       if avg_population <= 0:
+           return 0.0
+       return avg_gdp / avg_population
+
+   def _calculate_reproduction_modifier(self, person: Person, partner: Optional[Person]) -> float:
+       """Combine genetics, knowledge, wellbeing, and economy into a fertility modifier."""
+       people = [person] + ([partner] if partner else [])
+       for p in people:
+           p._ensure_biological_params()
+
+       gene_scores = [
+           (p.nutrition_efficiency + p.starvation_resistance + p.health_resilience) / 3
+           for p in people
+       ]
+       gene_factor = max(0.7, min(1.3, sum(gene_scores) / len(gene_scores)))
+
+       avg_knowledge = sum(len(p.known_primes) for p in people) / len(people)
+       knowledge_score = math.log1p(avg_knowledge) / math.log1p(10)
+       knowledge_score = min(1.0, max(0.0, knowledge_score))
+       knowledge_factor = 0.8 + 0.5 * knowledge_score
+
+       wellbeing_scores = []
+       for p in people:
+           nutrition_norm = min(1.0, p.nutrition_level / max(NUTRITION_REQUIREMENT, 0.01))
+           wellbeing = (0.4 * (p.health / 100) + 0.4 * (p.happiness / 100) +
+                        0.2 * nutrition_norm)
+           wellbeing_scores.append(min(1.0, max(0.0, wellbeing)))
+       wellbeing_score = sum(wellbeing_scores) / len(wellbeing_scores)
+       wellbeing_factor = 0.7 + 0.6 * wellbeing_score
+
+       region = person.location.region
+       stats = self.region_stats.get(region, {})
+       avg_resources = stats.get('avg_resources', 0.0)
+       employment_rate = stats.get('employment_rate', 0.0)
+       gini = stats.get('gini', 0.0)
+       starvation_rate = stats.get('starvation_rate', 0.0)
+       res_norm = avg_resources / (avg_resources + 300) if avg_resources > 0 else 0.0
+       equality = 1 - min(1.0, max(0.0, gini))
+       starvation_relief = 1 - min(1.0, max(0.0, starvation_rate))
+       gdp_per_capita = self._get_recent_gdp_per_capita()
+       gdp_score = math.log1p(gdp_per_capita) / math.log1p(GDP_PER_CAPITA_NORM)
+       gdp_score = min(1.0, max(0.0, gdp_score))
+
+       economy_score = (0.35 * res_norm + 0.25 * employment_rate +
+                        0.15 * equality + 0.15 * starvation_relief + 0.1 * gdp_score)
+       economy_factor = 0.7 + 0.6 * min(1.0, max(0.0, economy_score))
+
+       modifier = gene_factor * knowledge_factor * wellbeing_factor * economy_factor
+       return max(REPRODUCTION_MODIFIER_MIN, min(REPRODUCTION_MODIFIER_MAX, modifier))
+
    def _estimate_competency(self, person: Person) -> float:
        """Estimate a productivity score for salary offers."""
        knowledge_score = len(person.known_primes) * 0.6
@@ -1960,13 +2025,19 @@ class World:
            relationship_factor = max(0.2, relationship_score / 100)
            chance = BASE_REPRODUCTION_CHANCE * (0.5 + combined_resources) * (0.5 + happiness_factor)
            chance *= relationship_factor
-           return random.random() < min(chance, 0.02)
+           modifier = self._calculate_reproduction_modifier(person, partner)
+           chance *= modifier
+           max_chance = BASE_REPRODUCTION_CAP * modifier
+           return random.random() < min(chance, max_chance)
        
        # Allow single-parent births at a lower rate
        resource_factor = min(1.5, person.resources / CHILD_COST)
        happiness_factor = person.happiness / 100
        chance = SINGLE_PARENT_REPRODUCTION_CHANCE * (0.5 + resource_factor) * (0.5 + happiness_factor)
-       return random.random() < min(chance, 0.01)
+       modifier = self._calculate_reproduction_modifier(person, None)
+       chance *= modifier
+       max_chance = SINGLE_PARENT_REPRODUCTION_CAP * modifier
+       return random.random() < min(chance, max_chance)
    
    def _handle_birth(self, parent: Person):
        """Handle birth of new person"""
