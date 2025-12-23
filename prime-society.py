@@ -35,7 +35,7 @@ SPACE_PER_CELL = 1000.0  # cubic units
 
 # Resource Parameters
 DAILY_ONE_PRODUCTION = 1.0  # "1"s produced per person per day
-NUTRITION_REQUIREMENT = 1.0  # nutrition needed per person per day
+NUTRITION_REQUIREMENT = 0.75  # nutrition needed per person per day
 STARVATION_THRESHOLD = 0.3  # below this, person starts dying
 NUTRITION_ABSORPTION_RATE = 1.0  # nutrition gained per unit consumed
 NUTRITION_BUFFER_TARGET = 1.5
@@ -52,15 +52,15 @@ MARKET_FRICTION = 0.01
 KNOWLEDGE_DECAY_RATE = 0.01 / 365  # per day if unused
 KNOWLEDGE_TRANSFER_RATE = 1 / 30  # one prime per 30 days of mentoring
 START_COMPANY_RESOURCE_THRESHOLD = 300.0
-BASE_SALARY = 10.0
+BASE_SALARY = 1.0
 HIRING_CAPITAL_DAYS = 15
 MAX_COMPANY_SIZE = 500
 GLOBAL_COMPANY_POP_RATIO = 200
 REGION_COMPANY_POP_RATIO = 150
 REGION_MARKET_MIN_POP = 30
-MIN_PROFIT_MARGIN = 0.5
+MIN_PROFIT_MARGIN = 0.1
 MARKET_DEMAND_LOOKBACK_DAYS = 14
-MIN_MARKET_DEMAND = 2.0
+MIN_MARKET_DEMAND = 1.0
 STARTUP_STAPLE_PRODUCTS = (2, 3, 5, 7)
 
 # Social Parameters
