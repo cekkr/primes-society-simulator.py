@@ -37,6 +37,7 @@ SPACE_PER_CELL = 1000.0  # cubic units
 DAILY_ONE_PRODUCTION = 2.0  # "1"s produced per person per day
 NUTRITION_REQUIREMENT = 1.0  # nutrition needed per person per day
 STARVATION_THRESHOLD = 0.3  # below this, person starts dying
+NUTRITION_ABSORPTION_RATE = 1.0  # nutrition gained per unit consumed
 
 # Economic Parameters
 PRIME_DISCOVERY_COST_MULTIPLIER = 10
@@ -45,6 +46,10 @@ ENTROPY_LOSS = 0.05  # production inefficiency
 MARKET_FRICTION = 0.02
 KNOWLEDGE_DECAY_RATE = 0.01 / 365  # per day if unused
 KNOWLEDGE_TRANSFER_RATE = 1 / 30  # one prime per 30 days of mentoring
+START_COMPANY_RESOURCE_THRESHOLD = 300.0
+BASE_SALARY = 10.0
+HIRING_CAPITAL_DAYS = 15
+MAX_COMPANY_SIZE = 50
 
 # Social Parameters
 TRAIT_INHERITANCE_VARIANCE = 20
@@ -54,6 +59,9 @@ RELATIONSHIP_DECAY = 0.01  # per day without interaction
 CHILD_COST = 365  # total cost to raise a child (to do: define value meaning)
 MIN_REPRODUCTION_AGE = 16
 MAX_REPRODUCTION_AGE = 55
+BASE_REPRODUCTION_CHANCE = 0.002
+SINGLE_PARENT_REPRODUCTION_CHANCE = 0.0004
+REPRODUCTION_RELATIONSHIP_THRESHOLD = 20
 
 # Life Cycle Parameters
 LIFE_STAGES = {
@@ -74,6 +82,12 @@ ELECTION_CYCLES = {
    'region': 1095
 }
 CORRUPTION_THRESHOLD = 70  # trait value above which corruption likely
+
+# Early Simulation Support
+STARTUP_WELLBEING_DAYS = 120
+STARTUP_DAILY_NUTRITION = 0.5
+STARTUP_DAILY_STIPEND = 10.0
+INITIAL_RESOURCE_GRANT = 100.0
 
 # Meme Parameters
 MEME_SPREAD_BASE_RATE = 0.1
@@ -328,7 +342,7 @@ class Person:
        
        # Check for natural death
        life_expectancy_days = BASE_LIFE_EXPECTANCY * 365
-       death_probability = max(0, (self.age - life_expectancy_days) / (365 * 10))
+       death_probability = max(0, (self.age - life_expectancy_days) / (365 * 25))
        if self.health <= 0 or random.random() < death_probability:
            self.die()
    
@@ -695,6 +709,10 @@ class Market:
        self.prices[1] = 1.0  # Base resource
        self.prices[2] = calculate_nutrition(2) / calculate_weight(2) * 10
 
+   def start_day(self):
+       """Reset daily trading volume"""
+       self.volume.clear()
+
    def set_world(self, world: 'World'):
        """Attach the world for trade settlement"""
        self.world = world
@@ -929,7 +947,7 @@ class World:
        for i in range(INITIAL_POPULATION):
            person = Person()
            person.age = random.randint(0, 60 * 365)  # Random ages up to 60
-           person.resources = random.uniform(50, 500)
+           person.resources = random.uniform(50, 500) + INITIAL_RESOURCE_GRANT
            
            # Give some initial knowledge based on age
            if person.age > 16 * 365:
@@ -948,7 +966,7 @@ class World:
                    if p.age >= 16 * 365 and p.employer is None]
        if not eligible:
            return
-       seed_count = max(1, len(eligible) // 2000)
+       seed_count = max(1, len(eligible) // 500)
        founders = sorted(eligible, key=lambda p: p.resources, reverse=True)[:seed_count]
        for founder in founders:
            if founder.resources <= 0:
@@ -1013,6 +1031,7 @@ class World:
        """Simulate one day in the world"""
        self.current_day += 1
        set_current_day(self.current_day)
+       self.market.start_day()
        logger.info(f"Day {self.current_day} - Population: {len(self.people)}")
        
        # Phase 1: Individual activities (40% of processing)
@@ -1089,9 +1108,9 @@ class World:
        unemployed = [p for p in self.people.values() 
                      if p.is_alive and p.age >= 16 * 365 and not p.employer]
        
-       for person in unemployed[:100]:  # Limit to prevent slowdown
+       for person in unemployed[:min(1000, len(unemployed))]:  # Limit to prevent slowdown
            # Look for job or start company
-           if person.resources > 1000 and random.random() < 0.01:
+           if person.resources > START_COMPANY_RESOURCE_THRESHOLD and random.random() < 0.02:
                # Start a company
                company = Company(person, f"{person.id[:8]}_Corp")
                self.companies[company.id] = company
@@ -1100,14 +1119,13 @@ class World:
                # Look for employment
                for company in random.sample(list(self.companies.values()), 
                                            min(5, len(self.companies))):
-                   if len(company.employees) < 20:  # Company size limit
+                   if len(company.employees) < MAX_COMPANY_SIZE:  # Company size limit
                        # Check if person's knowledge is useful
                        new_knowledge = person.known_primes - company.collective_knowledge
-                       if new_knowledge:
-                           salary = len(new_knowledge) * 10
-                           if company.capital > salary * 30:  # Can afford for 30 days
-                               company.hire(person, salary)
-                               break
+                       salary = BASE_SALARY + len(new_knowledge) * 4
+                       if company.capital > salary * HIRING_CAPITAL_DAYS:  # Can afford for N days
+                           company.hire(person, salary)
+                           break
    
    def _phase_market(self):
        """Market transactions and price discovery"""
@@ -1137,13 +1155,17 @@ class World:
                    # Place buy order
                    market_price = self.market.get_price(best_deal)
                    bid_price = market_price * (1 + MARKET_FRICTION)
-                   quantity = min(person.resources / bid_price, 10)
+                   nutrition_per_unit = calculate_nutrition(best_deal) * NUTRITION_ABSORPTION_RATE
+                   if nutrition_per_unit <= 0:
+                       continue
+                   desired_units = need / nutrition_per_unit
+                   quantity = min(desired_units, person.resources / bid_price, 10)
                    if quantity <= 0:
                        continue
                    self.market.place_order(best_deal, quantity, bid_price, True, person.id)
                    
                    # Simplified - immediate consumption
-                   person.nutrition_level += calculate_nutrition(best_deal) * quantity * 0.1
+                   person.nutrition_level += nutrition_per_unit * quantity
                    person.resources -= bid_price * quantity
        
        # Natural "1" production
@@ -1196,6 +1218,13 @@ class World:
        """System updates and maintenance"""
        # Political system update
        self.political_system.daily_update(self)
+
+       # Startup wellbeing support
+       if self.current_day <= STARTUP_WELLBEING_DAYS:
+           for person in self.people.values():
+               if person.is_alive:
+                   person.nutrition_level += STARTUP_DAILY_NUTRITION
+                   person.resources += STARTUP_DAILY_STIPEND
        
        # Building construction
        if random.random() < 0.01:  # 1% chance of new building
@@ -1239,21 +1268,38 @@ class World:
        if age_years < MIN_REPRODUCTION_AGE or age_years > MAX_REPRODUCTION_AGE:
            return False
        
-       # Need resources and a partner
-       if person.resources < CHILD_COST:
+       # Need resources
+       if person.resources < CHILD_COST * 0.5:
            return False
        
        # Find potential partner
+       partner = None
+       relationship_score = 0.0
        if person.relationships:
            best_relationship = max(person.relationships.items(), key=lambda x: x[1])
-           if best_relationship[1] > 50:  # Strong relationship
+           if best_relationship[1] > REPRODUCTION_RELATIONSHIP_THRESHOLD:  # Relationship threshold
                partner_id = best_relationship[0]
                if partner_id in self.people:
-                   partner = self.people[partner_id]
-                   if partner.is_alive and partner.resources > CHILD_COST / 2:
-                       return random.random() < 0.001  # 0.1% chance per day
+                   candidate = self.people[partner_id]
+                   candidate_age = candidate.age / 365
+                   if (candidate.is_alive and candidate.resources > CHILD_COST * 0.5 and
+                           MIN_REPRODUCTION_AGE <= candidate_age <= MAX_REPRODUCTION_AGE):
+                       partner = candidate
+                       relationship_score = best_relationship[1]
        
-       return False
+       if partner:
+           combined_resources = (person.resources + partner.resources) / (CHILD_COST * 2)
+           happiness_factor = (person.happiness + partner.happiness) / 200
+           relationship_factor = max(0.2, relationship_score / 100)
+           chance = BASE_REPRODUCTION_CHANCE * (0.5 + combined_resources) * (0.5 + happiness_factor)
+           chance *= relationship_factor
+           return random.random() < min(chance, 0.02)
+       
+       # Allow single-parent births at a lower rate
+       resource_factor = min(1.5, person.resources / CHILD_COST)
+       happiness_factor = person.happiness / 100
+       chance = SINGLE_PARENT_REPRODUCTION_CHANCE * (0.5 + resource_factor) * (0.5 + happiness_factor)
+       return random.random() < min(chance, 0.01)
    
    def _handle_birth(self, parent: Person):
        """Handle birth of new person"""
@@ -1261,9 +1307,14 @@ class World:
        partner = None
        if parent.relationships:
            best_relationship = max(parent.relationships.items(), key=lambda x: x[1])
-           partner_id = best_relationship[0]
-           if partner_id in self.people:
-               partner = self.people[partner_id]
+           if best_relationship[1] > REPRODUCTION_RELATIONSHIP_THRESHOLD:
+               partner_id = best_relationship[0]
+               if partner_id in self.people:
+                   candidate = self.people[partner_id]
+                   candidate_age = candidate.age / 365
+                   if (candidate.is_alive and candidate.resources > CHILD_COST * 0.5 and
+                           MIN_REPRODUCTION_AGE <= candidate_age <= MAX_REPRODUCTION_AGE):
+                       partner = candidate
        
        # Create child
        if partner:
@@ -1275,9 +1326,11 @@ class World:
        child.location = parent.location
        
        # Parents pay cost
-       parent.resources -= CHILD_COST / 2
        if partner:
+           parent.resources -= CHILD_COST / 2
            partner.resources -= CHILD_COST / 2
+       else:
+           parent.resources -= CHILD_COST
        
        # Family relationships
        child.family['parent1'] = parent.id
@@ -1355,11 +1408,16 @@ class World:
                self.add_person(immigrant)
        
        # Prevent economic collapse
-       if self.stats['gdp'] and self.stats['gdp'][-1] < 100:
-           logger.warning("Economic collapse detected - injecting resources")
-           for person in random.sample(list(self.people.values()), 
-                                      min(100, len(self.people))):
-               person.resources += 100
+       if self.current_day > STARTUP_WELLBEING_DAYS and len(self.stats['gdp']) >= 14:
+           avg_gdp = np.mean(self.stats['gdp'][-14:])
+           gdp_per_capita = avg_gdp / max(1, population)
+           resources = [p.resources for p in self.people.values() if p.is_alive]
+           avg_resources = np.mean(resources) if resources else 0
+           if gdp_per_capita < 0.2 and avg_resources < 50:
+               logger.warning("Economic collapse detected - injecting resources")
+               sample_size = min(max(100, population // 20), population)
+               for person in random.sample(list(self.people.values()), sample_size):
+                   person.resources += 100
        
        # Prevent starvation
        starving = [p for p in self.people.values() 
