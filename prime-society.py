@@ -116,6 +116,8 @@ SINGLE_PARENT_REPRODUCTION_CAP = 0.015
 REPRODUCTION_MODIFIER_MIN = 0.6
 REPRODUCTION_MODIFIER_MAX = 1.6
 GDP_PER_CAPITA_NORM = 2.0
+CHILD_COST_MULTIPLIER_MIN = 0.7
+CHILD_COST_MULTIPLIER_MAX = 1.6
 
 # Life Cycle Parameters
 LIFE_STAGES = {
@@ -142,6 +144,12 @@ STARTUP_WELLBEING_DAYS = 120
 STARTUP_DAILY_NUTRITION = 0.5
 STARTUP_DAILY_STIPEND = 10.0
 INITIAL_RESOURCE_GRANT = 100.0
+INITIAL_NUTRITION_RESERVE = 2.5
+
+# Hunger Motivation Parameters
+HUNGER_WORK_THRESHOLD = 0.9
+SURVIVAL_WORK_ENERGY = 20
+SURVIVAL_WORK_GAIN = 6.0
 
 # Meme Parameters
 MEME_SPREAD_BASE_RATE = 0.5
@@ -344,7 +352,7 @@ class Person:
        
        # Resources and needs
        self.resources = 100.0  # Starting resources
-       self.nutrition_level = 1.0  # Full nutrition
+       self.nutrition_level = INITIAL_NUTRITION_RESERVE  # Initial nutrition buffer
        self.energy = 100.0  # Daily energy
        self.stress = 0.0
        self.happiness = 50.0
@@ -520,6 +528,8 @@ class Person:
        # Work if employed
        if self.employer and self.age >= 16 * 365:
            self.work()
+       elif self.age >= 16 * 365:
+           self.survival_work()
        
        # Social interactions
        self.socialize(world)
@@ -530,6 +540,18 @@ class Person:
        
        # Update happiness
        self.update_happiness()
+
+   def survival_work(self):
+       """Do subsistence work when hungry and unemployed."""
+       if self.nutrition_level >= NUTRITION_REQUIREMENT * HUNGER_WORK_THRESHOLD:
+           return
+       if self.energy < SURVIVAL_WORK_ENERGY:
+           return
+       self.energy -= SURVIVAL_WORK_ENERGY
+       hunger_pressure = max(0.0, (NUTRITION_REQUIREMENT - self.nutrition_level) / max(NUTRITION_REQUIREMENT, 0.01))
+       payout = SURVIVAL_WORK_GAIN * (1 + hunger_pressure * 0.5)
+       self.resources += payout
+       self.stress += 4 + hunger_pressure * 2
    
    def work(self):
        """Perform work activities"""
@@ -1444,6 +1466,24 @@ class World:
            return 0.0
        return avg_gdp / avg_population
 
+   def _calculate_child_cost(self, region: int) -> float:
+       """Adjust child costs based on economy and market tightness."""
+       gdp_per_capita = self._get_recent_gdp_per_capita()
+       gdp_score = math.log1p(gdp_per_capita) / math.log1p(GDP_PER_CAPITA_NORM)
+       gdp_score = min(1.0, max(0.0, gdp_score))
+
+       demand = 0.0
+       supply = 0.0
+       for number in range(2, 6):
+           demand += self.market.get_recent_volume(number, MARKET_DEMAND_LOOKBACK_DAYS)
+           supply += self.market.get_total_ask_quantity(number)
+       demand_pressure = demand / (supply + 1.0)
+       demand_pressure = min(2.0, max(0.5, demand_pressure))
+
+       multiplier = 1.0 + 0.3 * (demand_pressure - 1) + 0.3 * (1 - gdp_score)
+       multiplier = max(CHILD_COST_MULTIPLIER_MIN, min(CHILD_COST_MULTIPLIER_MAX, multiplier))
+       return CHILD_COST * multiplier
+
    def _region_opportunity_score(self, region: int) -> float:
        """Score regions for migration opportunities."""
        stats = self.region_stats.get(region, {})
@@ -1624,6 +1664,7 @@ class World:
        """Find a viable product for a new company"""
        best_product = None
        best_score = -float('inf')
+       market_active = bool(self.stats['gdp'] and self.stats['gdp'][-1] > 0)
        for number in range(2, 10):
            if not self._can_produce_with_primes(number, known_primes):
                continue
@@ -1634,7 +1675,10 @@ class World:
                continue
            demand = self.market.get_recent_volume(number, MARKET_DEMAND_LOOKBACK_DAYS)
            if demand < MIN_MARKET_DEMAND:
-               continue
+               if self.current_day <= STARTUP_WELLBEING_DAYS and not market_active:
+                   demand = MIN_MARKET_DEMAND
+               else:
+                   continue
            score = margin * (1 + demand)
            if score > best_score:
                best_score = score
@@ -2091,7 +2135,8 @@ class World:
            return False
        
        # Need resources
-       if person.resources < CHILD_COST * 0.5:
+       child_cost = self._calculate_child_cost(person.location.region)
+       if person.resources < child_cost * 0.5:
            return False
        
        # Find potential partner
@@ -2104,13 +2149,13 @@ class World:
                if partner_id in self.people:
                    candidate = self.people[partner_id]
                    candidate_age = candidate.age / 365
-                   if (candidate.is_alive and candidate.resources > CHILD_COST * 0.5 and
+           if (candidate.is_alive and candidate.resources > child_cost * 0.5 and
                            MIN_REPRODUCTION_AGE <= candidate_age <= MAX_REPRODUCTION_AGE):
-                       partner = candidate
-                       relationship_score = best_relationship[1]
+               partner = candidate
+               relationship_score = best_relationship[1]
        
        if partner:
-           combined_resources = (person.resources + partner.resources) / (CHILD_COST * 2)
+           combined_resources = (person.resources + partner.resources) / (child_cost * 2)
            happiness_factor = (person.happiness + partner.happiness) / 200
            relationship_factor = max(0.2, relationship_score / 100)
            chance = BASE_REPRODUCTION_CHANCE * (0.5 + combined_resources) * (0.5 + happiness_factor)
@@ -2121,7 +2166,7 @@ class World:
            return random.random() < min(chance, max_chance)
        
        # Allow single-parent births at a lower rate
-       resource_factor = min(1.5, person.resources / CHILD_COST)
+       resource_factor = min(1.5, person.resources / child_cost)
        happiness_factor = person.happiness / 100
        chance = SINGLE_PARENT_REPRODUCTION_CHANCE * (0.5 + resource_factor) * (0.5 + happiness_factor)
        modifier = self._calculate_reproduction_modifier(person, None)
@@ -2154,11 +2199,12 @@ class World:
        child.location = parent.location
        
        # Parents pay cost
+       child_cost = self._calculate_child_cost(parent.location.region)
        if partner:
-           parent.resources -= CHILD_COST / 2
-           partner.resources -= CHILD_COST / 2
+           parent.resources -= child_cost / 2
+           partner.resources -= child_cost / 2
        else:
-           parent.resources -= CHILD_COST
+           parent.resources -= child_cost
        
        # Family relationships
        child.family['parent1'] = parent.id
