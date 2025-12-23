@@ -1018,15 +1018,15 @@ class World:
        logger.info(f"Initialized {INITIAL_POPULATION} people")
 
    def _refresh_market_cache(self):
-       """Update cached population and company counts by region"""
-       self._population_by_region = defaultdict(int)
-       for person in self.people.values():
-           if person.is_alive:
-               self._population_by_region[person.location.region] += 1
-      self._companies_by_region = defaultdict(int)
-      for company in self.companies.values():
-           if company.location and not company.is_bankrupt:
-              self._companies_by_region[company.location.region] += 1
+    """Update cached population and company counts by region"""
+    self._population_by_region = defaultdict(int)
+    for person in self.people.values():
+        if person.is_alive:
+            self._population_by_region[person.location.region] += 1
+    self._companies_by_region = defaultdict(int)
+    for company in self.companies.values():
+        if company.location and not company.is_bankrupt:
+            self._companies_by_region[company.location.region] += 1
 
    def _seed_companies(self):
        """Bootstrap a small number of companies to start market activity"""
