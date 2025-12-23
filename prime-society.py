@@ -27,16 +27,16 @@ import sys
 # ============= GAME CONSTANTS (EASILY TWEAKABLE) =============
 
 # World Parameters
-INITIAL_POPULATION = 10000
+INITIAL_POPULATION = 5000
 WORLD_REGIONS = 1000
 DISTRICTS_PER_REGION = 16
 CELLS_PER_DISTRICT = 10000  # 100x100 grid
 SPACE_PER_CELL = 10000.0  # cubic units
 
 # Resource Parameters
-DAILY_ONE_PRODUCTION = 1.5  # "1"s produced per person per day
-NUTRITION_REQUIREMENT = 0.5  # nutrition needed per person per day
-STARVATION_THRESHOLD = 0.3  # below this, person starts dying
+DAILY_ONE_PRODUCTION = 1.0  # "1"s produced per person per day
+NUTRITION_REQUIREMENT = 0.75  # nutrition needed per person per day
+STARVATION_THRESHOLD = 0.2  # below this, person starts dying
 NUTRITION_ABSORPTION_RATE = 1.0  # nutrition gained per unit consumed
 NUTRITION_BUFFER_TARGET = 1.5
 MAX_NUTRITION_LEVEL = 10.0
@@ -57,7 +57,7 @@ HIRING_CAPITAL_DAYS = 5
 MAX_COMPANY_SIZE = 1000
 GLOBAL_COMPANY_POP_RATIO = 200
 REGION_COMPANY_POP_RATIO = 150
-REGION_MARKET_MIN_POP = 30
+REGION_MARKET_MIN_POP = 10
 MIN_PROFIT_MARGIN = 0.1
 MARKET_DEMAND_LOOKBACK_DAYS = 14
 MIN_MARKET_DEMAND = 0.5
@@ -112,7 +112,7 @@ GRAPH_UPDATE_FREQUENCY = 10  # days
 TRACKED_METRICS = ['population', 'gdp', 'gini', 'happiness', 'knowledge', 'innovation']
 
 # Checkpoint Parameters
-CHECKPOINT_FREQUENCY = 100  # days
+CHECKPOINT_FREQUENCY = 1000  # days
 MAX_CHECKPOINTS = 10
 AUTO_SAVE = True
 CHECKPOINT_DIR = "checkpoints"
