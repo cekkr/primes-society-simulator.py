@@ -38,6 +38,11 @@ DAILY_ONE_PRODUCTION = 2.0  # "1"s produced per person per day
 NUTRITION_REQUIREMENT = 1.0  # nutrition needed per person per day
 STARVATION_THRESHOLD = 0.3  # below this, person starts dying
 NUTRITION_ABSORPTION_RATE = 1.0  # nutrition gained per unit consumed
+NUTRITION_BUFFER_TARGET = 1.5
+MAX_NUTRITION_LEVEL = 3.0
+HEALTH_RECOVERY_RATE = 0.2
+STARVATION_DAMAGE_BASE = 0.8
+STARVATION_DAMAGE_SCALE = 4.0
 
 # Economic Parameters
 PRIME_DISCOVERY_COST_MULTIPLIER = 50
@@ -50,6 +55,13 @@ START_COMPANY_RESOURCE_THRESHOLD = 300.0
 BASE_SALARY = 10.0
 HIRING_CAPITAL_DAYS = 15
 MAX_COMPANY_SIZE = 500
+GLOBAL_COMPANY_POP_RATIO = 200
+REGION_COMPANY_POP_RATIO = 150
+REGION_MARKET_MIN_POP = 30
+MIN_PROFIT_MARGIN = 0.5
+MARKET_DEMAND_LOOKBACK_DAYS = 14
+MIN_MARKET_DEMAND = 2.0
+STARTUP_STAPLE_PRODUCTS = (2, 3, 5, 7)
 
 # Social Parameters
 TRAIT_INHERITANCE_VARIANCE = 20
@@ -279,6 +291,10 @@ class Person:
        self.stress = 0.0
        self.happiness = 50.0
        self.health = 100.0
+       self.metabolism = random.uniform(0.9, 1.1)
+       expectancy = random.gauss(BASE_LIFE_EXPECTANCY, 8)
+       expectancy = max(50, min(MAX_AGE, expectancy))
+       self.life_expectancy_days = int(expectancy * 365)
        
        # Relationships
        self.relationships: Dict[str, float] = {}  # person_id -> relationship strength
@@ -341,8 +357,8 @@ class Person:
            self.health -= 0.02
        
        # Check for natural death
-       life_expectancy_days = BASE_LIFE_EXPECTANCY * 365
-       death_probability = max(0, (self.age - life_expectancy_days) / (365 * 25))
+       life_expectancy_days = self.life_expectancy_days
+       death_probability = max(0, (self.age - life_expectancy_days) / (365 * 30))
        if self.health <= 0 or random.random() < death_probability:
            self.die()
    
@@ -365,10 +381,16 @@ class Person:
        self.energy = 100 - (self.age / (365 * 100)) * 20  # Age reduces energy
        
        # Consume nutrition
-       self.nutrition_level -= NUTRITION_REQUIREMENT
+       self.nutrition_level -= NUTRITION_REQUIREMENT * self.metabolism
+       if self.nutrition_level < 0:
+           self.nutrition_level = 0
        if self.nutrition_level < STARVATION_THRESHOLD:
-           self.health -= 5
-           self.stress += 10
+           deficit = STARVATION_THRESHOLD - self.nutrition_level
+           starvation_damage = STARVATION_DAMAGE_BASE + deficit * STARVATION_DAMAGE_SCALE
+           self.health -= starvation_damage * self.metabolism
+           self.stress += 6 + deficit * 8
+       elif self.nutrition_level >= NUTRITION_REQUIREMENT:
+           self.health = min(100, self.health + HEALTH_RECOVERY_RATE)
        
        # Work if employed
        if self.employer and self.age >= 16 * 365:
@@ -494,6 +516,13 @@ class Company:
        self.name = name or f"Company_{self.id[:8]}"
        self.founder_id = founder.id
        self.founded_day = 0
+       self.location = Location(
+           region=founder.location.region,
+           district=founder.location.district,
+           cell_x=founder.location.cell_x,
+           cell_y=founder.location.cell_y,
+           z=founder.location.z
+       )
        
        # Resources
        self.capital = founder.resources * 0.5  # Founder invests half their resources
@@ -503,6 +532,7 @@ class Company:
        # Employees
        self.employees: List[Person] = [founder]
        founder.employer = self
+       self.is_bankrupt = False
        
        # Knowledge
        self.collective_knowledge: Set[int] = founder.known_primes.copy()
@@ -573,13 +603,21 @@ class Company:
    def pay_salaries(self):
        """Pay all employees"""
        total_salaries = sum(e.salary for e in self.employees)
+       if total_salaries <= 0:
+           return
        if self.capital >= total_salaries:
            self.capital -= total_salaries
            for employee in self.employees:
                employee.resources += employee.salary
        else:
-           # Company bankruptcy
-           self.bankruptcy()
+           pay_ratio = self.capital / total_salaries
+           if pay_ratio < 0.2:
+               # Company bankruptcy
+               self.bankruptcy()
+           else:
+               for employee in self.employees:
+                   employee.resources += employee.salary * pay_ratio
+               self.capital = 0
    
    def bankruptcy(self):
        """Handle company bankruptcy"""
@@ -588,6 +626,7 @@ class Company:
            self.fire(employee)
        self.capital = 0
        self.inventory = {}
+       self.is_bankrupt = True
 
 class Building:
    """Physical structure in the world"""
@@ -703,6 +742,7 @@ class Market:
        self.prices: Dict[int, float] = {}  # Current market prices
        self.volume: Dict[int, float] = defaultdict(float)  # Daily trading volume
        self.price_history: Dict[int, deque] = defaultdict(lambda: deque(maxlen=365))
+       self.volume_history: Dict[int, deque] = defaultdict(lambda: deque(maxlen=30))
        self.world: Optional['World'] = None
        
        # Initialize base prices
@@ -711,6 +751,8 @@ class Market:
 
    def start_day(self):
        """Reset daily trading volume"""
+       for number, volume in self.volume.items():
+           self.volume_history[number].append(volume)
        self.volume.clear()
 
    def set_world(self, world: 'World'):
@@ -809,6 +851,16 @@ class Market:
    def calculate_gdp(self) -> float:
        """Calculate total economic activity"""
        return sum(self.volume[n] * self.get_price(n) for n in self.volume)
+
+   def get_recent_volume(self, number: int, days: int = MARKET_DEMAND_LOOKBACK_DAYS) -> float:
+       """Average daily volume over the recent window"""
+       history = self.volume_history.get(number)
+       if not history:
+           return 0.0
+       window = list(history)[-days:]
+       if not window:
+           return 0.0
+       return sum(window) / len(window)
 
 class PoliticalSystem:
    """Handles elections and governance"""
@@ -938,6 +990,9 @@ class World:
            'prime_discoveries': defaultdict(int),
            'meme_spread': []
        }
+
+       self._population_by_region: Dict[int, int] = defaultdict(int)
+       self._companies_by_region: Dict[int, int] = defaultdict(int)
        
        # Initialize population
        self._initialize_population()
@@ -957,8 +1012,21 @@ class World:
            
            self.add_person(person)
 
+       self._refresh_market_cache()
        self._seed_companies()
+       self._refresh_market_cache()
        logger.info(f"Initialized {INITIAL_POPULATION} people")
+
+   def _refresh_market_cache(self):
+       """Update cached population and company counts by region"""
+       self._population_by_region = defaultdict(int)
+       for person in self.people.values():
+           if person.is_alive:
+               self._population_by_region[person.location.region] += 1
+      self._companies_by_region = defaultdict(int)
+      for company in self.companies.values():
+           if company.location and not company.is_bankrupt:
+              self._companies_by_region[company.location.region] += 1
 
    def _seed_companies(self):
        """Bootstrap a small number of companies to start market activity"""
@@ -971,9 +1039,64 @@ class World:
        for founder in founders:
            if founder.resources <= 0:
                continue
+           target_product = self._evaluate_company_start(founder)
+           if target_product is None:
+               continue
            company = Company(founder, f"{founder.id[:8]}_Corp")
+           company.production_targets = [target_product]
            self.companies[company.id] = company
            self.stats['companies_founded'] += 1
+           self._companies_by_region[company.location.region] += 1
+
+   def _can_produce_with_primes(self, number: int, known_primes: Set[int]) -> bool:
+       """Check if a set of primes can produce a number"""
+       if is_prime(number):
+           return number in known_primes
+       factors = factorize(number)
+       return all(prime in known_primes for prime in factors.keys())
+
+   def _find_best_startup_product(self, known_primes: Set[int]) -> Optional[int]:
+       """Find a viable product for a new company"""
+       best_product = None
+       best_score = -float('inf')
+       for number in range(2, 10):
+           if not self._can_produce_with_primes(number, known_primes):
+               continue
+           price = self.market.get_price(number)
+           cost = calculate_weight(number)
+           margin = price - cost
+           if margin < MIN_PROFIT_MARGIN:
+               continue
+           demand = self.market.get_recent_volume(number, MARKET_DEMAND_LOOKBACK_DAYS)
+           min_demand = MIN_MARKET_DEMAND
+           if self.current_day <= STARTUP_WELLBEING_DAYS and number in STARTUP_STAPLE_PRODUCTS:
+               min_demand = 0.0
+           if demand < min_demand:
+               continue
+           score = margin * (1 + demand)
+           if score > best_score:
+               best_score = score
+               best_product = number
+       return best_product
+
+   def _evaluate_company_start(self, founder: Person) -> Optional[int]:
+       """Check if the market can support a new company and return a target product"""
+       if founder.resources < START_COMPANY_RESOURCE_THRESHOLD:
+           return None
+
+       global_limit = max(3, len(self.people) // GLOBAL_COMPANY_POP_RATIO)
+       if len(self.companies) >= global_limit:
+           return None
+
+       region = founder.location.region
+       local_population = self._population_by_region.get(region, 0)
+       local_companies = self._companies_by_region.get(region, 0)
+       if local_population >= REGION_MARKET_MIN_POP:
+           local_limit = max(1, local_population // REGION_COMPANY_POP_RATIO)
+           if local_companies >= local_limit:
+               return None
+
+       return self._find_best_startup_product(founder.known_primes)
    
    def add_person(self, person: Person):
        """Add a person to the world"""
@@ -1032,6 +1155,7 @@ class World:
        self.current_day += 1
        set_current_day(self.current_day)
        self.market.start_day()
+       self._refresh_market_cache()
        logger.info(f"Day {self.current_day} - Population: {len(self.people)}")
        
        # Phase 1: Individual activities (40% of processing)
@@ -1078,6 +1202,8 @@ class World:
        """Work and production phase"""
        # Companies produce goods
        for company in list(self.companies.values()):
+           if company.is_bankrupt:
+               continue
            if company.employees:
                # Decide what to produce based on market prices
                profitable_products = []
@@ -1089,6 +1215,11 @@ class World:
                        profitable_products.append((profit_margin, n))
                
                if profitable_products:
+                   if company.production_targets:
+                       profitable_products = [
+                           product for product in profitable_products
+                           if product[1] in company.production_targets
+                       ] or profitable_products
                    profitable_products.sort(reverse=True)
                    best_product = profitable_products[0][1]
                    
@@ -1112,9 +1243,13 @@ class World:
            # Look for job or start company
            if person.resources > START_COMPANY_RESOURCE_THRESHOLD and random.random() < 0.02:
                # Start a company
-               company = Company(person, f"{person.id[:8]}_Corp")
-               self.companies[company.id] = company
-               self.stats['companies_founded'] += 1
+               target_product = self._evaluate_company_start(person)
+               if target_product is not None:
+                   company = Company(person, f"{person.id[:8]}_Corp")
+                   company.production_targets = [target_product]
+                   self.companies[company.id] = company
+                   self.stats['companies_founded'] += 1
+                   self._companies_by_region[company.location.region] += 1
            elif self.companies:
                # Look for employment
                for company in random.sample(list(self.companies.values()), 
@@ -1134,8 +1269,9 @@ class World:
            if not person.is_alive:
                continue
            
-           # Calculate nutrition need
-           need = NUTRITION_REQUIREMENT - person.nutrition_level
+           # Calculate nutrition need with buffer
+           target_level = max(NUTRITION_REQUIREMENT, NUTRITION_BUFFER_TARGET) * person.metabolism
+           need = target_level - person.nutrition_level
            if need > 0 and person.resources > 0:
                # Find affordable nutrition
                best_deal = None
@@ -1166,6 +1302,8 @@ class World:
                    
                    # Simplified - immediate consumption
                    person.nutrition_level += nutrition_per_unit * quantity
+                   if person.nutrition_level > MAX_NUTRITION_LEVEL:
+                       person.nutrition_level = MAX_NUTRITION_LEVEL
                    person.resources -= bid_price * quantity
        
        # Natural "1" production
@@ -1224,6 +1362,8 @@ class World:
            for person in self.people.values():
                if person.is_alive:
                    person.nutrition_level += STARTUP_DAILY_NUTRITION
+                   if person.nutrition_level > MAX_NUTRITION_LEVEL:
+                       person.nutrition_level = MAX_NUTRITION_LEVEL
                    person.resources += STARTUP_DAILY_STIPEND
        
        # Building construction
@@ -1247,8 +1387,9 @@ class World:
        
        # Company failures
        for company in list(self.companies.values()):
-           if company.capital < 0:
+           if company.capital < 0 and not company.is_bankrupt:
                company.bankruptcy()
+           if company.is_bankrupt or (company.capital <= 0 and not company.employees):
                del self.companies[company.id]
                self.stats['companies_failed'] += 1
        
@@ -1820,11 +1961,13 @@ def main():
    # Configure logging
    logging.getLogger().setLevel(getattr(logging, args.log_level))
    
-   # Set random seed if provided
-   if args.seed is not None:
-       random.seed(args.seed)
-       np.random.seed(args.seed)
-       logger.info(f"Random seed set to {args.seed}")
+   # Set random seed (auto-generate if not provided)
+   if args.seed is None:
+       args.seed = int(datetime.utcnow().timestamp() * 1_000_000) % (2**32)
+       logger.info(f"Random seed not provided - using {args.seed}")
+   random.seed(args.seed)
+   np.random.seed(args.seed)
+   logger.info(f"Random seed set to {args.seed}")
    
    # Override global settings   
    INITIAL_POPULATION = args.population
