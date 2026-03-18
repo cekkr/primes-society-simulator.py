@@ -51,7 +51,7 @@ CELLS_PER_DISTRICT = 10000  # 100x100 grid
 SPACE_PER_CELL = 10000.0  # cubic units
 
 # Resource Parameters
-DAILY_ONE_PRODUCTION = 1.0  # "1"s produced per person per day
+DAILY_ONE_PRODUCTION = 0.75  # "1"s produced per person per day
 NUTRITION_REQUIREMENT = 0.75  # nutrition needed per person per day
 STARVATION_THRESHOLD = 0.2  # below this, person starts dying
 NUTRITION_ABSORPTION_RATE = 1.0  # nutrition gained per unit consumed
@@ -239,7 +239,7 @@ BITMAP_FONT_5X7 = {
 
 # Checkpoint Parameters
 CHECKPOINT_FREQUENCY = 1000  # days
-MAX_CHECKPOINTS = 100
+MAX_CHECKPOINTS = 1000
 AUTO_SAVE = True
 CHECKPOINT_DIR = "checkpoints"
 
