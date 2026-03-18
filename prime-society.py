@@ -101,6 +101,8 @@ MIGRATION_BASE_RATE = 0.002
 MIGRATION_COST_BASE = 20.0
 MIGRATION_COOLDOWN_DAYS = 90
 MIGRATION_OPPORTUNITY_THRESHOLD = 0.05
+DAILY_LOCAL_MOVE_RATE = 0.35
+DAILY_DISTRICT_MOVE_RATE = 0.05
 COMPANY_DISTRESS_DEBT_FACTOR = 10
 COMPANY_MIN_DEBT_LIMIT = 30.0
 COMPANY_MAX_DISTRESS_DAYS = 18
@@ -189,6 +191,51 @@ ENABLE_REGION_MULTITHREADING = True
 REGION_THREAD_WORKERS = max(2, min(16, os.cpu_count() or 4))
 MIN_PARALLEL_PEOPLE = 500
 MIN_PARALLEL_COMPANIES = 50
+
+BITMAP_FONT_5X7 = {
+   'A': ["01110", "10001", "10001", "11111", "10001", "10001", "10001"],
+   'B': ["11110", "10001", "10001", "11110", "10001", "10001", "11110"],
+   'C': ["01111", "10000", "10000", "10000", "10000", "10000", "01111"],
+   'D': ["11110", "10001", "10001", "10001", "10001", "10001", "11110"],
+   'E': ["11111", "10000", "10000", "11110", "10000", "10000", "11111"],
+   'F': ["11111", "10000", "10000", "11110", "10000", "10000", "10000"],
+   'G': ["01111", "10000", "10000", "10111", "10001", "10001", "01111"],
+   'H': ["10001", "10001", "10001", "11111", "10001", "10001", "10001"],
+   'I': ["11111", "00100", "00100", "00100", "00100", "00100", "11111"],
+   'J': ["00001", "00001", "00001", "00001", "10001", "10001", "01110"],
+   'K': ["10001", "10010", "10100", "11000", "10100", "10010", "10001"],
+   'L': ["10000", "10000", "10000", "10000", "10000", "10000", "11111"],
+   'M': ["10001", "11011", "10101", "10001", "10001", "10001", "10001"],
+   'N': ["10001", "11001", "10101", "10011", "10001", "10001", "10001"],
+   'O': ["01110", "10001", "10001", "10001", "10001", "10001", "01110"],
+   'P': ["11110", "10001", "10001", "11110", "10000", "10000", "10000"],
+   'Q': ["01110", "10001", "10001", "10001", "10101", "10010", "01101"],
+   'R': ["11110", "10001", "10001", "11110", "10100", "10010", "10001"],
+   'S': ["01111", "10000", "10000", "01110", "00001", "00001", "11110"],
+   'T': ["11111", "00100", "00100", "00100", "00100", "00100", "00100"],
+   'U': ["10001", "10001", "10001", "10001", "10001", "10001", "01110"],
+   'V': ["10001", "10001", "10001", "10001", "10001", "01010", "00100"],
+   'W': ["10001", "10001", "10001", "10001", "10101", "11011", "10001"],
+   'X': ["10001", "10001", "01010", "00100", "01010", "10001", "10001"],
+   'Y': ["10001", "10001", "01010", "00100", "00100", "00100", "00100"],
+   'Z': ["11111", "00001", "00010", "00100", "01000", "10000", "11111"],
+   '0': ["01110", "10001", "10011", "10101", "11001", "10001", "01110"],
+   '1': ["00100", "01100", "00100", "00100", "00100", "00100", "01110"],
+   '2': ["01110", "10001", "00001", "00010", "00100", "01000", "11111"],
+   '3': ["11110", "00001", "00001", "01110", "00001", "00001", "11110"],
+   '4': ["00010", "00110", "01010", "10010", "11111", "00010", "00010"],
+   '5': ["11111", "10000", "10000", "11110", "00001", "00001", "11110"],
+   '6': ["01110", "10000", "10000", "11110", "10001", "10001", "01110"],
+   '7': ["11111", "00001", "00010", "00100", "01000", "01000", "01000"],
+   '8': ["01110", "10001", "10001", "01110", "10001", "10001", "01110"],
+   '9': ["01110", "10001", "10001", "01111", "00001", "00001", "01110"],
+   ':': ["00000", "00100", "00100", "00000", "00100", "00100", "00000"],
+   '/': ["00001", "00010", "00100", "01000", "10000", "00000", "00000"],
+   '.': ["00000", "00000", "00000", "00000", "00000", "00110", "00110"],
+   '-': ["00000", "00000", "00000", "11111", "00000", "00000", "00000"],
+   ' ': ["00000", "00000", "00000", "00000", "00000", "00000", "00000"],
+   '?': ["01110", "10001", "00010", "00100", "00100", "00000", "00100"]
+}
 
 # Checkpoint Parameters
 CHECKPOINT_FREQUENCY = 1000  # days
@@ -1945,6 +1992,7 @@ class World:
        # Daily routine is region-parallel; cross-region relationship outcomes
        # (e.g. reproduction checks) are committed sequentially to avoid locks.
        self._run_region_tasks(region_people, self._process_region_individual_batch, MIN_PARALLEL_PEOPLE)
+       self._apply_daily_local_movement(people_list)
 
        for person in people_list:
            if person.is_alive and self._check_reproduction(person):
@@ -1962,6 +2010,39 @@ class World:
        for person in people:
            if person.is_alive:
                person.daily_routine(self)
+
+   def _apply_daily_local_movement(self, people: List[Person]):
+       """Apply short-range mobility so movement is visible and spatially dynamic."""
+       for person in people:
+           if not person.is_alive:
+               continue
+           if random.random() > DAILY_LOCAL_MOVE_RATE:
+               continue
+
+           current = person.location
+           if random.random() < DAILY_DISTRICT_MOVE_RATE:
+               new_district = random.randint(0, DISTRICTS_PER_REGION - 1)
+               new_x = random.randint(0, 9)
+               new_y = random.randint(0, 9)
+           else:
+               new_district = current.district
+               new_x = max(0, min(9, current.cell_x + random.randint(-2, 2)))
+               new_y = max(0, min(9, current.cell_y + random.randint(-2, 2)))
+
+           if (new_district == current.district and new_x == current.cell_x and
+                   new_y == current.cell_y):
+               continue
+
+           self.move_person(
+               person,
+               Location(
+                   region=current.region,
+                   district=new_district,
+                   cell_x=new_x,
+                   cell_y=new_y,
+                   z=current.z
+               )
+           )
    
    def _phase_work(self):
        """Work and production phase"""
@@ -2657,11 +2738,32 @@ class PygameViewer:
            self.font_mode = "freetype"
            return True
        except Exception as exc:
-           logger.warning(f"No available pygame font backend: {exc}")
-           self.font_mode = "none"
-           self.font = None
-           self.small_font = None
-           return False
+           logger.warning(f"No available pygame font backend, using builtin bitmap text: {exc}")
+           self.font_mode = "bitmap"
+           self.font = "bitmap_large"
+           self.small_font = "bitmap_small"
+           return True
+
+   def _render_bitmap_surface(self, text: str, color: Tuple[int, int, int], scale: int):
+       """Render text using built-in 5x7 bitmap glyphs."""
+       text = text.upper()
+       glyph_w = 5 * scale
+       glyph_h = 7 * scale
+       spacing = scale
+       width = max(1, len(text) * (glyph_w + spacing))
+       surface = pygame.Surface((width, glyph_h), pygame.SRCALPHA)
+       x = 0
+       for ch in text:
+           glyph = BITMAP_FONT_5X7.get(ch, BITMAP_FONT_5X7['?'])
+           for row_idx, row in enumerate(glyph):
+               for col_idx, bit in enumerate(row):
+                   if bit == '1':
+                       surface.fill(
+                           color,
+                           (x + col_idx * scale, row_idx * scale, scale, scale)
+                       )
+           x += glyph_w + spacing
+       return surface
 
    def _render_text(self, font_obj, text: str, color: Tuple[int, int, int]):
        """Render text with whichever backend is active."""
@@ -2672,6 +2774,9 @@ class PygameViewer:
        if self.font_mode == "freetype":
            surface, _ = font_obj.render(text, fgcolor=color)
            return surface
+       if self.font_mode == "bitmap":
+           scale = 3 if font_obj == "bitmap_large" else 2
+           return self._render_bitmap_surface(text, color, scale)
        return None
 
    def initialize(self) -> bool:
@@ -2867,14 +2972,14 @@ class PygameViewer:
            f"Moved people/day: {moved_people}",
            f"Moved companies/day: {moved_companies}",
        ]
+       line_height = 20
        for line in lines:
            text = self._render_text(self.small_font, line, (218, 224, 236))
            if text:
                self.screen.blit(text, (panel_rect.x + 14, y))
-           y += 24
+           y += line_height
 
-       chart_height = 170
-       chart_gap = 16
+       chart_gap = 10
        chart_width = panel_rect.width - 28
        chart_x = panel_rect.x + 14
        chart_y = y + 12
@@ -2885,7 +2990,11 @@ class PygameViewer:
            ('Happiness', list(self.metric_history['happiness']), (180, 110, 245), (110, 220, 255), (0.0, 100.0)),
            ('Companies', list(self.metric_history['companies']), (235, 120, 120), (136, 236, 140), None)
        ]
+       available_height = max(160, panel_rect.bottom - chart_y - 12)
+       chart_height = max(86, int((available_height - chart_gap * (len(charts) - 1)) / max(1, len(charts))))
        for label, values, c0, c1, bounds in charts:
+           if chart_y + chart_height > panel_rect.bottom - 8:
+               break
            rect = pygame.Rect(chart_x, chart_y, chart_width, chart_height)
            self._draw_gradient_chart(rect, label, values, c0, c1, bounds)
            chart_y += chart_height + chart_gap
