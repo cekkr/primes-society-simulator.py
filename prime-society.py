@@ -22,15 +22,24 @@ import argparse
 import logging
 import json
 import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Dict, List, Set, Tuple, Optional, Any
 from enum import Enum
-import matplotlib.pyplot as plt
-import matplotlib.animation as animation
+try:
+   import matplotlib.pyplot as plt
+   import matplotlib.animation as animation
+   MATPLOTLIB_AVAILABLE = True
+except ImportError:
+   plt = None
+   animation = None
+   MATPLOTLIB_AVAILABLE = False
 from datetime import datetime
 import os
 import sys
+pygame = None
+PYGAME_AVAILABLE = None
 
 # ============= GAME CONSTANTS (EASILY TWEAKABLE) =============
 
@@ -92,6 +101,13 @@ MIGRATION_BASE_RATE = 0.002
 MIGRATION_COST_BASE = 20.0
 MIGRATION_COOLDOWN_DAYS = 90
 MIGRATION_OPPORTUNITY_THRESHOLD = 0.05
+COMPANY_DISTRESS_DEBT_FACTOR = 10
+COMPANY_MIN_DEBT_LIMIT = 30.0
+COMPANY_MAX_DISTRESS_DAYS = 18
+COMPANY_RESTRUCTURE_PAY_RATIO = 0.55
+COMPANY_RESTRUCTURE_MIN_EMPLOYEES = 1
+COMPANY_RESTRUCTURE_LAYOFF_SHARE = 0.2
+COMPANY_COMPETITION_CAPITAL_FRACTION = 0.25
 
 # Cultural Dynamics Parameters
 CULTURE_DIM = 50
@@ -157,9 +173,22 @@ MEME_DECAY_RATE = 0.05
 MEME_MUTATION_CHANCE = 0.05
 
 # Visualization Parameters
-ENABLE_GRAPHS = True
+ENABLE_GRAPHS = False
+ENABLE_PYGAME_VIEWER = True
 GRAPH_UPDATE_FREQUENCY = 10  # days
 TRACKED_METRICS = ['population', 'gdp', 'gini', 'happiness', 'knowledge', 'innovation']
+PYGAME_VIEWER_FPS = 30
+PYGAME_WINDOW_WIDTH = 1500
+PYGAME_WINDOW_HEIGHT = 900
+PYGAME_HISTORY_POINTS = 240
+PYGAME_MAX_VISIBLE_PEOPLE = 1400
+PYGAME_MAX_VISIBLE_COMPANIES = 400
+
+# Performance Parameters
+ENABLE_REGION_MULTITHREADING = True
+REGION_THREAD_WORKERS = max(2, min(16, os.cpu_count() or 4))
+MIN_PARALLEL_PEOPLE = 500
+MIN_PARALLEL_COMPANIES = 50
 
 # Checkpoint Parameters
 CHECKPOINT_FREQUENCY = 1000  # days
@@ -175,6 +204,21 @@ def set_current_day(day: int) -> None:
    """Update the day used in log formatting."""
    global CURRENT_DAY
    CURRENT_DAY = day
+
+def ensure_pygame() -> bool:
+   """Lazily import pygame only when realtime viewer is enabled."""
+   global pygame, PYGAME_AVAILABLE
+   if PYGAME_AVAILABLE is not None:
+       return PYGAME_AVAILABLE
+   try:
+       os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "hide")
+       import pygame as _pygame
+       pygame = _pygame
+       PYGAME_AVAILABLE = True
+   except ImportError:
+       pygame = None
+       PYGAME_AVAILABLE = False
+   return PYGAME_AVAILABLE
 
 class DayFilter(logging.Filter):
    def filter(self, record: logging.LogRecord) -> bool:
@@ -717,6 +761,7 @@ class Company:
        self.shares_outstanding = 1000.0
        self.shareholders: Dict[str, float] = {}
        self.last_funding_day = -INVESTMENT_COOLDOWN_DAYS
+       self.distress_days = 0
    
    def update_collective_knowledge(self):
        """Update company's collective knowledge from employees"""
@@ -740,10 +785,15 @@ class Company:
        
        # Calculate production cost
        weight = calculate_weight(number)
+       if weight <= 0 or quantity <= 0:
+           return 0
        cost = weight * quantity
        
        if self.capital < cost:
-           quantity = self.capital / weight
+           quantity = max(0.0, self.capital / weight)
+           cost = weight * quantity
+       if quantity <= 0:
+           return 0
        
        # Produce with entropy loss
        produced = quantity * (1 - ENTROPY_LOSS)
@@ -772,25 +822,70 @@ class Company:
            person.employer = None
            person.salary = 0
            self.update_collective_knowledge()
+
+   def total_salary_bill(self) -> float:
+       """Current total payroll obligation."""
+       return sum(e.salary for e in self.employees)
+
+   def debt_limit(self) -> float:
+       """Debt floor before mandatory bankruptcy."""
+       payroll_floor = self.total_salary_bill() * COMPANY_DISTRESS_DEBT_FACTOR
+       structural_floor = max(COMPANY_MIN_DEBT_LIMIT, len(self.employees) * 5.0)
+       return -max(payroll_floor, structural_floor)
+
+   def restructure_if_needed(self):
+       """Trim payroll when cash is insufficient."""
+       salary_bill = self.total_salary_bill()
+       if salary_bill <= 0:
+           return
+       if len(self.employees) <= COMPANY_RESTRUCTURE_MIN_EMPLOYEES:
+           return
+       if self.capital >= salary_bill * COMPANY_RESTRUCTURE_PAY_RATIO:
+           return
+
+       layoff_count = max(1, int(math.ceil(len(self.employees) * COMPANY_RESTRUCTURE_LAYOFF_SHARE)))
+       candidates = [e for e in self.employees if e.id != self.founder_id]
+       if not candidates:
+           return
+       random.shuffle(candidates)
+       fired = 0
+       for employee in candidates:
+           self.fire(employee)
+           fired += 1
+           if fired >= layoff_count:
+               break
+       if fired:
+           self.reputation = max(-100, self.reputation - fired * 2)
    
    def pay_salaries(self):
        """Pay all employees"""
-       total_salaries = sum(e.salary for e in self.employees)
+       total_salaries = self.total_salary_bill()
        if total_salaries <= 0:
            return
-       if self.capital >= total_salaries:
-           self.capital -= total_salaries
-           for employee in self.employees:
-               employee.resources += employee.salary
+       if self.capital < total_salaries * COMPANY_RESTRUCTURE_PAY_RATIO:
+           self.restructure_if_needed()
+           total_salaries = self.total_salary_bill()
+           if total_salaries <= 0:
+               return
+
+       payout = max(0.0, min(self.capital, total_salaries))
+       pay_ratio = payout / total_salaries if total_salaries > 0 else 0.0
+       if pay_ratio <= 0 and self.capital <= self.debt_limit():
+           self.bankruptcy()
+           return
+
+       for employee in self.employees:
+           employee.resources += employee.salary * pay_ratio
+       self.capital -= payout
+
+   def update_financial_distress(self):
+       """Track consecutive distress days and recover when healthy."""
+       if self.capital < 0:
+           self.distress_days += 1
+       elif self.capital > 0:
+           self.distress_days = max(0, self.distress_days - 2)
        else:
-           pay_ratio = self.capital / total_salaries
-           if pay_ratio < 0.2:
-               # Company bankruptcy
-               self.bankruptcy()
-           else:
-               for employee in self.employees:
-                   employee.resources += employee.salary * pay_ratio
-               self.capital = 0
+           self.distress_days = max(0, self.distress_days - 1)
    
    def bankruptcy(self):
        """Handle company bankruptcy"""
@@ -800,6 +895,7 @@ class Company:
        self.capital = 0
        self.inventory = {}
        self.is_bankrupt = True
+       self.distress_days = 0
 
    def ensure_financial_params(self):
        """Ensure financing attributes exist (for older checkpoints)."""
@@ -809,6 +905,8 @@ class Company:
            self.shareholders = {}
        if not hasattr(self, 'last_funding_day'):
            self.last_funding_day = -INVESTMENT_COOLDOWN_DAYS
+       if not hasattr(self, 'distress_days'):
+           self.distress_days = 0
 
    def estimate_stock_price(self) -> float:
        """Estimate a simple stock price from capital and size."""
@@ -1361,6 +1459,8 @@ class World:
        self._population_by_region: Dict[int, int] = defaultdict(int)
        self._companies_by_region: Dict[int, int] = defaultdict(int)
        self.region_stats: Dict[int, Dict[str, float]] = {}
+       self.enable_region_threads = ENABLE_REGION_MULTITHREADING
+       self.region_thread_workers = max(1, REGION_THREAD_WORKERS)
        
        # Initialize population
        self._initialize_population()
@@ -1397,6 +1497,37 @@ class World:
        for company in self.companies.values():
            if company.location and not company.is_bankrupt:
                self._companies_by_region[company.location.region] += 1
+
+   def _ensure_runtime_params(self):
+       """Ensure runtime-only attributes exist (for older checkpoints)."""
+       if not hasattr(self, 'enable_region_threads'):
+           self.enable_region_threads = ENABLE_REGION_MULTITHREADING
+       if not hasattr(self, 'region_thread_workers'):
+           self.region_thread_workers = max(1, REGION_THREAD_WORKERS)
+
+   def _run_region_tasks(self, region_items: Dict[int, List[Any]], task_fn, min_items: int) -> List[Any]:
+       """Run region tasks in parallel when worthwhile."""
+       tasks = [(region, items) for region, items in region_items.items() if items]
+       if not tasks:
+           return []
+
+       total_items = sum(len(items) for _, items in tasks)
+       if (not self.enable_region_threads or self.region_thread_workers <= 1 or
+               total_items < min_items or len(tasks) <= 1):
+           return [task_fn(region, items) for region, items in tasks]
+
+       max_workers = min(self.region_thread_workers, len(tasks))
+       results: List[Any] = []
+       with ThreadPoolExecutor(max_workers=max_workers) as executor:
+           futures = {executor.submit(task_fn, region, items): region for region, items in tasks}
+           for future in as_completed(futures):
+               try:
+                   results.append(future.result())
+               except Exception as exc:
+                   region = futures[future]
+                   logger.error(f"Region task failed for region {region}: {exc}")
+                   raise
+       return results
 
    def _collect_region_stats(self) -> Dict[int, Dict[str, float]]:
        """Aggregate region-level metrics for cultural dynamics."""
@@ -1773,6 +1904,7 @@ class World:
    
    def simulate_day(self):
        """Simulate one day in the world"""
+       self._ensure_runtime_params()
        self.current_day += 1
        set_current_day(self.current_day)
        self.market.start_day()
@@ -1803,76 +1935,52 @@ class World:
    
    def _phase_individual(self):
        """Individual daily routines"""
-       people_list = list(self.people.values())
+       people_list = [p for p in self.people.values() if p.is_alive]
        random.shuffle(people_list)
-       
+
+       region_people: Dict[int, List[Person]] = defaultdict(list)
        for person in people_list:
-           if person.is_alive:
-               person.daily_routine(self)
-               
-               # Handle births
-               if self._check_reproduction(person):
-                   self._handle_birth(person)
-       
+           region_people[person.location.region].append(person)
+
+       # Daily routine is region-parallel; cross-region relationship outcomes
+       # (e.g. reproduction checks) are committed sequentially to avoid locks.
+       self._run_region_tasks(region_people, self._process_region_individual_batch, MIN_PARALLEL_PEOPLE)
+
+       for person in people_list:
+           if person.is_alive and self._check_reproduction(person):
+               self._handle_birth(person)
+
        # Remove dead people
        dead = [p for p in self.people.values() if not p.is_alive]
        for person in dead:
            self.stats['deaths'] += 1
            self.remove_person(person)
+
+   def _process_region_individual_batch(self, region: int, people: List[Person]):
+       """Process individual routines for one region partition."""
+       random.shuffle(people)
+       for person in people:
+           if person.is_alive:
+               person.daily_routine(self)
    
    def _phase_work(self):
        """Work and production phase"""
-       # Companies produce goods
-       for company in list(self.companies.values()):
-           if company.is_bankrupt:
+       # Companies produce goods (region-partitioned); market orders are committed after workers finish.
+       region_companies: Dict[int, List[Company]] = defaultdict(list)
+       for company in self.companies.values():
+           if not company.is_bankrupt:
+               region_companies[company.location.region].append(company)
+
+       regional_orders = self._run_region_tasks(
+           region_companies,
+           self._process_region_company_batch,
+           MIN_PARALLEL_COMPANIES
+       )
+       for batch in regional_orders:
+           if not batch:
                continue
-           company.ensure_financial_params()
-           cultural_params = self.get_cultural_params(company.location.region)
-           local_stats = self.region_stats.get(company.location.region, {})
-           competition_pressure = 1 + local_stats.get('company_density', 0.0) * 2
-           competition_cost = cultural_params['competition_cost'] * len(company.employees) * competition_pressure
-           company.capital -= competition_cost
-           if company.employees and company.capital > 0:
-               innovation_cost = cultural_params['innovation_cost'] * len(company.employees)
-               if company.capital > innovation_cost:
-                   company.capital -= innovation_cost
-                   training_boost = (innovation_cost / max(1, len(company.employees))) * 5
-                   for employee in random.sample(company.employees, min(3, len(company.employees))):
-                       employee.apply_training_boost(training_boost)
-           if company.employees:
-               # Decide what to produce based on market prices
-               profitable_products = []
-               for n in range(2, 20):  # Check first 20 numbers
-                   if company.can_produce(n):
-                       efficiency = calculate_efficiency(n)
-                       price = self.market.get_price(n)
-                       profit_margin = price * efficiency
-                       profitable_products.append((profit_margin, n))
-               
-               if profitable_products:
-                   if company.production_targets:
-                       profitable_products = [
-                           product for product in profitable_products
-                           if product[1] in company.production_targets
-                       ] or profitable_products
-                   profitable_products.sort(reverse=True)
-                   best_product = profitable_products[0][1]
-                   
-                   # Produce
-                   production_capacity = len(company.employees) * 10
-                   produced = company.produce(best_product, production_capacity)
-                   
-                   if produced > 0:
-                       # Place sell order
-                       price = self.market.get_price(best_product) * (1 - MARKET_FRICTION)
-                       self.market.place_order(best_product, produced, price, False, company.id)
-               
-               # Pay salaries
-               company.pay_salaries()
-               salary_bill = sum(e.salary for e in company.employees)
-               buffer_target = salary_bill * cultural_params['hiring_capital_days']
-               if company.capital < buffer_target * 0.6:
-                   self._seek_investment(company, cultural_params, buffer_target - company.capital)
+           for number, quantity, price, trader_id in batch:
+               self.market.place_order(number, quantity, price, False, trader_id)
        
        # Job market - unemployed look for work
        unemployed = [p for p in self.people.values() 
@@ -1932,6 +2040,65 @@ class World:
            if best_company and best_offer:
                best_company.hire(person, best_offer)
                person.last_job_change_day = self.current_day
+
+   def _process_region_company_batch(self, region: int, companies: List[Company]) -> List[Tuple[int, float, float, str]]:
+       """Process company activity for one region and return sell orders."""
+       sell_orders: List[Tuple[int, float, float, str]] = []
+       for company in companies:
+           if company.is_bankrupt:
+               continue
+           company.ensure_financial_params()
+           cultural_params = self.get_cultural_params(region)
+           local_stats = self.region_stats.get(region, {})
+
+           competition_pressure = 1 + local_stats.get('company_density', 0.0) * 2
+           raw_competition_cost = cultural_params['competition_cost'] * len(company.employees) * competition_pressure
+           if company.capital > 0:
+               affordable_cap = company.capital * COMPANY_COMPETITION_CAPITAL_FRACTION + raw_competition_cost * 0.1
+               competition_cost = min(raw_competition_cost, affordable_cap)
+           else:
+               competition_cost = raw_competition_cost * 0.1
+           company.capital -= competition_cost
+
+           if company.employees and company.capital > 0:
+               innovation_cost = cultural_params['innovation_cost'] * len(company.employees)
+               if company.capital > innovation_cost:
+                   company.capital -= innovation_cost
+                   training_boost = (innovation_cost / max(1, len(company.employees))) * 5
+                   for employee in random.sample(company.employees, min(3, len(company.employees))):
+                       employee.apply_training_boost(training_boost)
+
+           if company.employees:
+               profitable_products = []
+               for n in range(2, 20):
+                   if company.can_produce(n):
+                       efficiency = calculate_efficiency(n)
+                       price = self.market.get_price(n)
+                       profit_margin = price * efficiency
+                       profitable_products.append((profit_margin, n))
+
+               if profitable_products:
+                   if company.production_targets:
+                       profitable_products = [
+                           product for product in profitable_products
+                           if product[1] in company.production_targets
+                       ] or profitable_products
+                   profitable_products.sort(reverse=True)
+                   best_product = profitable_products[0][1]
+                   production_capacity = len(company.employees) * 10
+                   produced = company.produce(best_product, production_capacity)
+                   if produced > 0:
+                       price = self.market.get_price(best_product) * (1 - MARKET_FRICTION)
+                       sell_orders.append((best_product, produced, price, company.id))
+
+               company.pay_salaries()
+               salary_bill = company.total_salary_bill()
+               buffer_target = salary_bill * cultural_params['hiring_capital_days']
+               if company.capital < buffer_target * 0.6:
+                   self._seek_investment(company, cultural_params, buffer_target - company.capital)
+
+           company.update_financial_distress()
+       return sell_orders
    
    def _phase_market(self):
        """Market transactions and price discovery"""
@@ -2112,9 +2279,15 @@ class World:
        
        # Company failures
        for company in list(self.companies.values()):
-           if company.capital < 0 and not company.is_bankrupt:
-               company.bankruptcy()
-           if company.is_bankrupt or (company.capital <= 0 and not company.employees):
+           company.ensure_financial_params()
+           if not company.is_bankrupt:
+               debt_limit = company.debt_limit()
+               if company.distress_days >= COMPANY_MAX_DISTRESS_DAYS and company.capital <= debt_limit:
+                   company.bankruptcy()
+               elif company.capital <= debt_limit * 0.6:
+                   company.restructure_if_needed()
+                   company.update_financial_distress()
+           if company.is_bankrupt or (not company.employees and company.capital <= company.debt_limit()):
                del self.companies[company.id]
                self.stats['companies_failed'] += 1
        
@@ -2311,8 +2484,10 @@ class Visualizer:
        self.fig = None
        self.axes = None
        
-       if ENABLE_GRAPHS:
+       if ENABLE_GRAPHS and MATPLOTLIB_AVAILABLE:
            self.setup_plots()
+       elif ENABLE_GRAPHS and not MATPLOTLIB_AVAILABLE:
+           logger.warning("matplotlib is not installed; graph plots disabled")
    
    def setup_plots(self):
        """Setup matplotlib figure with subplots"""
@@ -2407,6 +2582,359 @@ class Visualizer:
            self.fig.savefig(filename, dpi=150, bbox_inches='tight')
            logger.info(f"Plots saved to {filename}")
 
+class PygameViewer:
+   """Realtime simulation viewer with movement and gradient charts."""
+
+   def __init__(self, world: World):
+       self.world = world
+       self.enabled = bool(ENABLE_PYGAME_VIEWER)
+       self.initialized = False
+       self.screen = None
+       self.clock = None
+       self.font = None
+       self.small_font = None
+       self.font_mode = "none"
+       self.freetype = None
+       self.last_metric_day = -1
+       self.region_cols = max(1, int(math.ceil(math.sqrt(WORLD_REGIONS))))
+       self.region_rows = max(1, int(math.ceil(WORLD_REGIONS / self.region_cols)))
+       self.people_last_pos: Dict[str, Tuple[int, int]] = {}
+       self.company_last_pos: Dict[str, Tuple[int, int]] = {}
+       self.metric_history: Dict[str, deque] = {
+           'population': deque(maxlen=PYGAME_HISTORY_POINTS),
+           'gdp': deque(maxlen=PYGAME_HISTORY_POINTS),
+           'happiness': deque(maxlen=PYGAME_HISTORY_POINTS),
+           'companies': deque(maxlen=PYGAME_HISTORY_POINTS),
+           'births': deque(maxlen=PYGAME_HISTORY_POINTS),
+           'deaths': deque(maxlen=PYGAME_HISTORY_POINTS)
+       }
+       if self.enabled and not ensure_pygame():
+           self.enabled = False
+           logger.warning("pygame is not installed; realtime viewer disabled")
+
+   def _load_font(self, size: int):
+       """Load an available sans-serif font with fallback."""
+       for family in ["DejaVu Sans", "Noto Sans", "Liberation Sans", "Arial"]:
+           path = pygame.font.match_font(family) if pygame else None
+           if path:
+               return pygame.font.Font(path, size)
+       return pygame.font.Font(None, size)
+
+   def _load_freetype_font(self, size: int):
+       """Load a freetype fallback font when pygame.font is unavailable."""
+       default_font = self.freetype.get_default_font()
+       try:
+           return self.freetype.Font(default_font, size)
+       except Exception:
+           pass
+       try:
+           if pygame:
+               path = os.path.join(os.path.dirname(pygame.__file__), default_font)
+               return self.freetype.Font(path, size)
+       except Exception:
+           pass
+       return None
+
+   def _init_fonts(self):
+       """Initialize font backend with fallback to pygame.freetype."""
+       try:
+           pygame.font.init()
+           self.font = self._load_font(18)
+           self.small_font = self._load_font(14)
+           self.font_mode = "font"
+           return True
+       except Exception as exc:
+           logger.warning(f"pygame.font unavailable, switching to freetype fallback: {exc}")
+
+       try:
+           import pygame.freetype as freetype
+           freetype.init()
+           self.freetype = freetype
+           self.font = self._load_freetype_font(18)
+           self.small_font = self._load_freetype_font(14)
+           if not self.font or not self.small_font:
+               raise RuntimeError("freetype default font could not be loaded")
+           self.font_mode = "freetype"
+           return True
+       except Exception as exc:
+           logger.warning(f"No available pygame font backend: {exc}")
+           self.font_mode = "none"
+           self.font = None
+           self.small_font = None
+           return False
+
+   def _render_text(self, font_obj, text: str, color: Tuple[int, int, int]):
+       """Render text with whichever backend is active."""
+       if not font_obj:
+           return None
+       if self.font_mode == "font":
+           return font_obj.render(text, True, color)
+       if self.font_mode == "freetype":
+           surface, _ = font_obj.render(text, fgcolor=color)
+           return surface
+       return None
+
+   def initialize(self) -> bool:
+       """Initialize pygame resources lazily."""
+       if not self.enabled:
+           return False
+       if self.initialized:
+           return True
+       try:
+           pygame.init()
+           self.screen = pygame.display.set_mode((PYGAME_WINDOW_WIDTH, PYGAME_WINDOW_HEIGHT))
+           pygame.display.set_caption("Prime Society Realtime Viewer")
+           self.clock = pygame.time.Clock()
+           self._init_fonts()
+           self.initialized = True
+           return True
+       except Exception as exc:
+           logger.warning(f"pygame viewer initialization failed: {exc}")
+           self.enabled = False
+           return False
+
+   def close(self):
+       """Close pygame cleanly."""
+       if self.initialized and pygame:
+           pygame.quit()
+       self.initialized = False
+
+   def process_events(self) -> bool:
+       """Handle window events; return False when user requests exit."""
+       if not self.enabled:
+           return True
+       if not self.initialize():
+           return True
+       for event in pygame.event.get():
+           if event.type == pygame.QUIT:
+               return False
+           if event.type == pygame.KEYDOWN and event.key in (pygame.K_ESCAPE, pygame.K_q):
+               return False
+       return True
+
+   def update(self) -> bool:
+       """Render one frame."""
+       if not self.enabled:
+           return True
+       if not self.initialize():
+           return True
+       if self.world.current_day != self.last_metric_day:
+           self._append_metrics()
+       self._draw_frame()
+       pygame.display.flip()
+       if self.clock:
+           self.clock.tick(max(1, PYGAME_VIEWER_FPS))
+       return True
+
+   def _append_metrics(self):
+       stats = self.world.stats
+       self.metric_history['population'].append(float(len(self.world.people)))
+       self.metric_history['gdp'].append(float(stats['gdp'][-1]) if stats['gdp'] else 0.0)
+       self.metric_history['happiness'].append(float(stats['happiness'][-1]) if stats['happiness'] else 0.0)
+       self.metric_history['companies'].append(float(len(self.world.companies)))
+       self.metric_history['births'].append(float(stats['births']))
+       self.metric_history['deaths'].append(float(stats['deaths']))
+       self.last_metric_day = self.world.current_day
+
+   @staticmethod
+   def _lerp_color(color_a: Tuple[int, int, int], color_b: Tuple[int, int, int], t: float) -> Tuple[int, int, int]:
+       t = max(0.0, min(1.0, t))
+       return (
+           int(color_a[0] + (color_b[0] - color_a[0]) * t),
+           int(color_a[1] + (color_b[1] - color_a[1]) * t),
+           int(color_a[2] + (color_b[2] - color_a[2]) * t),
+       )
+
+   def _draw_frame(self):
+       self.screen.fill((14, 18, 24))
+       title = self._render_text(self.font, "Prime Society Realtime Viewer", (232, 236, 242))
+       if title:
+           self.screen.blit(title, (20, 16))
+
+       map_rect = pygame.Rect(20, 56, 940, 820)
+       panel_rect = pygame.Rect(980, 56, 500, 820)
+
+       pygame.draw.rect(self.screen, (22, 28, 38), map_rect, border_radius=8)
+       pygame.draw.rect(self.screen, (28, 34, 46), panel_rect, border_radius=8)
+       pygame.draw.rect(self.screen, (64, 74, 94), map_rect, width=1, border_radius=8)
+       pygame.draw.rect(self.screen, (64, 74, 94), panel_rect, width=1, border_radius=8)
+
+       self._draw_region_heatmap(map_rect)
+       moved_people, moved_companies = self._draw_entities(map_rect)
+       self._draw_stats_and_graphs(panel_rect, moved_people, moved_companies)
+
+   def _location_to_pixel(self, location: Location, map_rect) -> Tuple[int, int]:
+       region_col = location.region % self.region_cols
+       region_row = location.region // self.region_cols
+       district_size = int(math.sqrt(DISTRICTS_PER_REGION))
+       district_x = location.district % district_size
+       district_y = location.district // district_size
+
+       within_x = (district_x + (location.cell_x + 0.5) / 10.0) / district_size
+       within_y = (district_y + (location.cell_y + 0.5) / 10.0) / district_size
+       rel_x = (region_col + within_x) / self.region_cols
+       rel_y = (region_row + within_y) / self.region_rows
+
+       x = int(map_rect.x + rel_x * map_rect.width)
+       y = int(map_rect.y + rel_y * map_rect.height)
+       return x, y
+
+   def _draw_region_heatmap(self, map_rect):
+       region_stats = self.world.region_stats or {}
+       max_population = max((stats.get('population', 0) for stats in region_stats.values()), default=1)
+       cell_w = max(1, map_rect.width / self.region_cols)
+       cell_h = max(1, map_rect.height / self.region_rows)
+
+       for region in range(WORLD_REGIONS):
+           col = region % self.region_cols
+           row = region // self.region_cols
+           x = int(map_rect.x + col * cell_w)
+           y = int(map_rect.y + row * cell_h)
+           rect = pygame.Rect(x, y, max(1, int(cell_w) + 1), max(1, int(cell_h) + 1))
+
+           stats = region_stats.get(region, {})
+           population = stats.get('population', 0)
+           happiness = stats.get('avg_happiness', 0.0)
+           density = min(1.0, population / max(1, max_population))
+           happiness_ratio = min(1.0, max(0.0, happiness / 100.0))
+
+           base_color = self._lerp_color((18, 32, 62), (22, 96, 120), density)
+           hot_color = self._lerp_color((80, 72, 40), (242, 196, 64), happiness_ratio)
+           color = self._lerp_color(base_color, hot_color, 0.45)
+           pygame.draw.rect(self.screen, color, rect)
+
+   def _draw_entities(self, map_rect) -> Tuple[int, int]:
+       moved_people = 0
+       moved_companies = 0
+
+       visible_people = [p for p in self.world.people.values() if p.is_alive][:PYGAME_MAX_VISIBLE_PEOPLE]
+       active_people_ids = set()
+       for person in visible_people:
+           active_people_ids.add(person.id)
+           pos = self._location_to_pixel(person.location, map_rect)
+           prev = self.people_last_pos.get(person.id)
+           if prev and prev != pos:
+               moved_people += 1
+               trail_color = (110, 140, 220)
+               pygame.draw.line(self.screen, trail_color, prev, pos, 1)
+           self.people_last_pos[person.id] = pos
+
+           nutrition_ratio = min(1.0, person.nutrition_level / max(0.01, NUTRITION_REQUIREMENT))
+           happiness_ratio = min(1.0, max(0.0, person.happiness / 100.0))
+           color = (
+               int(210 - 150 * nutrition_ratio),
+               int(80 + 140 * happiness_ratio),
+               int(90 + 130 * nutrition_ratio)
+           )
+           pygame.draw.circle(self.screen, color, pos, 1)
+
+       self.people_last_pos = {pid: self.people_last_pos[pid] for pid in active_people_ids if pid in self.people_last_pos}
+
+       visible_companies = [c for c in self.world.companies.values() if not c.is_bankrupt][:PYGAME_MAX_VISIBLE_COMPANIES]
+       active_company_ids = set()
+       max_capital = max((max(0.0, c.capital) for c in visible_companies), default=1.0)
+       for company in visible_companies:
+           active_company_ids.add(company.id)
+           pos = self._location_to_pixel(company.location, map_rect)
+           prev = self.company_last_pos.get(company.id)
+           if prev and prev != pos:
+               moved_companies += 1
+               pygame.draw.line(self.screen, (255, 210, 120), prev, pos, 2)
+           self.company_last_pos[company.id] = pos
+
+           capital_ratio = min(1.0, max(0.0, company.capital / max_capital))
+           color = self._lerp_color((180, 70, 60), (110, 250, 170), capital_ratio)
+           pygame.draw.circle(self.screen, color, pos, 3)
+
+       self.company_last_pos = {
+           cid: self.company_last_pos[cid]
+           for cid in active_company_ids
+           if cid in self.company_last_pos
+       }
+       return moved_people, moved_companies
+
+   def _draw_stats_and_graphs(self, panel_rect, moved_people: int, moved_companies: int):
+       stats = self.world.stats
+       y = panel_rect.y + 14
+       lines = [
+           f"Day: {self.world.current_day}",
+           f"Population: {len(self.world.people)}",
+           f"Companies: {len(self.world.companies)}",
+           f"GDP: {stats['gdp'][-1]:.2f}" if stats['gdp'] else "GDP: 0.00",
+           f"Happiness: {stats['happiness'][-1]:.2f}" if stats['happiness'] else "Happiness: 0.00",
+           f"Gini: {stats['gini'][-1]:.3f}" if stats['gini'] else "Gini: 0.000",
+           f"Births: {stats['births']}  Deaths: {stats['deaths']}",
+           f"Moved people/day: {moved_people}",
+           f"Moved companies/day: {moved_companies}",
+       ]
+       for line in lines:
+           text = self._render_text(self.small_font, line, (218, 224, 236))
+           if text:
+               self.screen.blit(text, (panel_rect.x + 14, y))
+           y += 24
+
+       chart_height = 170
+       chart_gap = 16
+       chart_width = panel_rect.width - 28
+       chart_x = panel_rect.x + 14
+       chart_y = y + 12
+
+       charts = [
+           ('Population', list(self.metric_history['population']), (92, 160, 255), (120, 242, 196), None),
+           ('GDP', list(self.metric_history['gdp']), (255, 158, 92), (255, 238, 140), None),
+           ('Happiness', list(self.metric_history['happiness']), (180, 110, 245), (110, 220, 255), (0.0, 100.0)),
+           ('Companies', list(self.metric_history['companies']), (235, 120, 120), (136, 236, 140), None)
+       ]
+       for label, values, c0, c1, bounds in charts:
+           rect = pygame.Rect(chart_x, chart_y, chart_width, chart_height)
+           self._draw_gradient_chart(rect, label, values, c0, c1, bounds)
+           chart_y += chart_height + chart_gap
+
+   def _draw_gradient_chart(self, rect, label: str, values: List[float],
+                            start_color: Tuple[int, int, int], end_color: Tuple[int, int, int],
+                            bounds: Optional[Tuple[float, float]]):
+       pygame.draw.rect(self.screen, (18, 22, 30), rect, border_radius=6)
+       pygame.draw.rect(self.screen, (64, 72, 90), rect, width=1, border_radius=6)
+       title = self._render_text(self.small_font, label, (224, 232, 244))
+       if title:
+           self.screen.blit(title, (rect.x + 8, rect.y + 8))
+
+       if not values:
+           return
+
+       if bounds:
+           min_v, max_v = bounds
+       else:
+           min_v = min(values)
+           max_v = max(values)
+       if max_v - min_v < 1e-6:
+           max_v = min_v + 1.0
+
+       left = rect.x + 8
+       right = rect.x + rect.width - 8
+       top = rect.y + 30
+       bottom = rect.y + rect.height - 10
+       width = max(1, right - left)
+       height = max(1, bottom - top)
+
+       if len(values) == 1:
+           y = int(bottom - ((values[0] - min_v) / (max_v - min_v)) * height)
+           pygame.draw.circle(self.screen, end_color, (left, y), 3)
+       else:
+           for i in range(1, len(values)):
+               t0 = (i - 1) / (len(values) - 1)
+               t1 = i / (len(values) - 1)
+               x0 = int(left + width * t0)
+               x1 = int(left + width * t1)
+               y0 = int(bottom - ((values[i - 1] - min_v) / (max_v - min_v)) * height)
+               y1 = int(bottom - ((values[i] - min_v) / (max_v - min_v)) * height)
+               color = self._lerp_color(start_color, end_color, t1)
+               pygame.draw.line(self.screen, color, (x0, y0), (x1, y1), 2)
+
+       value_text = self._render_text(self.small_font, f"{values[-1]:.2f}", (196, 206, 224))
+       if value_text:
+           self.screen.blit(value_text, (rect.x + rect.width - 74, rect.y + 8))
+
 # ============= CHECKPOINT SYSTEM =============
 
 class CheckpointManager:
@@ -2492,6 +3020,10 @@ class CheckpointManager:
            self.world.political_system = state['political_system']
            self.world.stats = state['stats']
            self.world.grid = state['grid']
+           self.world.market.set_world(self.world)
+           self.world._ensure_runtime_params()
+           self.world._refresh_market_cache()
+           self.world._update_culture()
            
            set_current_day(self.world.current_day)
            logger.info(f"Checkpoint loaded: {filename} (Day {self.world.current_day})")
@@ -2528,6 +3060,7 @@ class SimulationController:
    def __init__(self):
        self.world = World()
        self.visualizer = Visualizer(self.world)
+       self.pygame_viewer = PygameViewer(self.world)
        self.checkpoint_manager = CheckpointManager(self.world)
        self.running = False
        self.target_days = 1000
@@ -2545,8 +3078,16 @@ class SimulationController:
        
        try:
            while self.running and self.world.current_day < start_day + self.target_days:
+               if not self.pygame_viewer.process_events():
+                   logger.info("Viewer closed by user - ending simulation")
+                   break
+
                # Simulate one day
                self.world.simulate_day()
+
+               if not self.pygame_viewer.update():
+                   logger.info("Viewer requested stop - ending simulation")
+                   break
                
                # Update graphs
                if ENABLE_GRAPHS and self.world.current_day % GRAPH_UPDATE_FREQUENCY == 0:
@@ -2569,6 +3110,7 @@ class SimulationController:
            raise
        finally:
            self.running = False
+           self.pygame_viewer.close()
            
            # Final statistics
            self.print_final_stats()
@@ -2625,6 +3167,10 @@ class SimulationController:
 
 def main():
    """Main entry point with CLI arguments"""
+   global INITIAL_POPULATION, AUTO_SAVE, ENABLE_GRAPHS, ENABLE_PYGAME_VIEWER
+   global ENABLE_REGION_MULTITHREADING, REGION_THREAD_WORKERS, PYGAME_VIEWER_FPS
+   global GLOBAL_SEED
+
    parser = argparse.ArgumentParser(
        description='Prime Society Simulator - A socio-economic simulation based on prime numbers'
    )
@@ -2636,7 +3182,6 @@ def main():
        help='Number of days to simulate (default: 1000)'
    )
    
-   global INITIAL_POPULATION
    parser.add_argument(
        '--population',
        type=int,
@@ -2659,10 +3204,35 @@ def main():
    parser.add_argument(
        '--no-graphs',
        action='store_true',
-       help='Disable visualization graphs'
+       help='Disable all visualization windows (pygame and matplotlib)'
+   )
+
+   parser.add_argument(
+       '--graphs',
+       action='store_true',
+       help='Enable matplotlib graphs in addition to the realtime pygame viewer'
+   )
+
+   parser.add_argument(
+       '--no-pygame',
+       action='store_true',
+       help='Disable realtime pygame viewer'
+   )
+
+   parser.add_argument(
+       '--viewer-fps',
+       type=int,
+       default=PYGAME_VIEWER_FPS,
+       help=f'Pygame viewer refresh rate (default: {PYGAME_VIEWER_FPS})'
+   )
+
+   parser.add_argument(
+       '--threads',
+       type=int,
+       default=REGION_THREAD_WORKERS,
+       help=f'Region worker threads for parallel phases (default: {REGION_THREAD_WORKERS})'
    )
    
-   global AUTO_SAVE
    parser.add_argument(
        '--auto-save',
        type=bool,
@@ -2701,12 +3271,21 @@ def main():
    random.seed(args.seed)
    np.random.seed(args.seed)
    logger.info(f"Random seed set to {args.seed}")
-   global GLOBAL_SEED
    GLOBAL_SEED = args.seed
    
-   # Override global settings   
+   # Override global settings
    INITIAL_POPULATION = args.population
-   ENABLE_GRAPHS = not args.no_graphs
+   if args.no_graphs:
+       ENABLE_GRAPHS = False
+       ENABLE_PYGAME_VIEWER = False
+   else:
+       ENABLE_PYGAME_VIEWER = not args.no_pygame
+       ENABLE_GRAPHS = args.graphs and MATPLOTLIB_AVAILABLE
+       if args.graphs and not MATPLOTLIB_AVAILABLE:
+           logger.warning("matplotlib not available - --graphs ignored")
+   PYGAME_VIEWER_FPS = max(1, args.viewer_fps)
+   REGION_THREAD_WORKERS = max(1, args.threads)
+   ENABLE_REGION_MULTITHREADING = REGION_THREAD_WORKERS > 1
    AUTO_SAVE = args.auto_save
    
    # Create simulation controller
@@ -2741,7 +3320,7 @@ def main():
        sim.run(args.days)
    
    # Keep plots open if enabled
-   if ENABLE_GRAPHS:
+   if ENABLE_GRAPHS and MATPLOTLIB_AVAILABLE and plt is not None:
        try:
            plt.show()
        except:
